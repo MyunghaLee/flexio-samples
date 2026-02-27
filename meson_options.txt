@@ -1,0 +1,4 @@
+option('cpu', type: 'array', value: ['bf3'], choices: ['cx7', 'bf3', 'cx8', 'cx9'],
+       description: 'Indicates which types of DPA CPU are going to be used.')
+option('dynamic', type: 'boolean', value: false,
+       description: 'Build DPA applications as dynamic.')
