@@ -37,6 +37,9 @@
 /* Used for geteuid function. */
 #include <unistd.h>
 
+/* Used for strtoul and other stdlib functions. */
+#include <stdlib.h>
+
 /* Used for host (x86/DPU) memory allocations. */
 #include <malloc.h>
 
@@ -61,6 +64,40 @@
 /* Flex IO packet processor device (DPA) side function stub. */
 extern flexio_func_t flexio_pp_dev;
 
+/* Per-thread resources: one event handler, one SQ/RQ pair, one set of steering rules. */
+struct thread_ctx {
+	uint32_t thread_index;
+
+	/* Event handler */
+	struct flexio_event_handler *pp_eh;
+
+	/* SQ resources */
+	struct flexio_cq   *flexio_sq_cq_ptr;
+	struct flexio_sq   *flexio_sq_ptr;
+	struct flexio_mkey *sqd_mkey;
+
+	/* RQ resources */
+	struct flexio_cq   *flexio_rq_cq_ptr;
+	struct flexio_rq   *flexio_rq_ptr;
+	struct flexio_mkey *rqd_mkey;
+
+	/* Transfer descriptors */
+	struct app_transfer_cq sq_cq_transf;
+	struct app_transfer_wq sq_transf;
+	struct app_transfer_cq rq_cq_transf;
+	struct app_transfer_wq rq_transf;
+
+	/* Flow steering (per-thread matcher + rule) */
+	struct flow_matcher *rx_matcher;
+	struct flow_rule    *rx_rule;
+	struct flow_matcher *tx_matcher;      /* NULL in nic_mode */
+	struct flow_rule    *tx_rule_table;   /* NULL in nic_mode */
+	struct flow_rule    *tx_rule_vport;   /* NULL in nic_mode */
+
+	/* DPA heap address of this thread's host2dev descriptor */
+	flexio_uintptr_t app_data_daddr;
+};
+
 /* Application context struct holding necessary host side variables. */
 struct app_context {
 	/* Flex IO process is used to load a program to the DPA. */
@@ -69,25 +106,10 @@ struct app_context {
 	struct flexio_app *flexio_app;
 	/* Flex IO message stream is used to get messages from the DPA. */
 	struct flexio_msg_stream *stream;
-	/* Flex IO event handler is used to execute code over the DPA. */
-	struct flexio_event_handler *pp_eh;
-	/* Flex IO SQ's CQ. */
-	struct flexio_cq *flexio_sq_cq_ptr;
-	/* Flex IO SQ. */
-	struct flexio_sq *flexio_sq_ptr;
-	/* Flex IO RQ's CQ. */
-	struct flexio_cq *flexio_rq_cq_ptr;
-	/* Flex IO RQ. */
-	struct flexio_rq *flexio_rq_ptr;
 	/* DPA user access register (DPA UAR) for all application's queues.
 	 * Will be set to the Flex IO process UAR.
 	 */
 	struct flexio_uar *process_uar;
-	/* Memory key (MKey) for SQ data. */
-	struct flexio_mkey *sqd_mkey;
-	/* MKey for RQ data. */
-	struct flexio_mkey *rqd_mkey;
-
 	/* Protection domain (PD) for all application's queues.
 	 * Will be set to the Flex IO process PD.
 	 */
@@ -95,34 +117,10 @@ struct app_context {
 	/* IBV context opened for the device name provided by the user. */
 	struct ibv_context *ibv_ctx;
 
-	/* RX flow matcher. */
-	struct flow_matcher *rx_matcher;
-	/* RX flow rule for matching incoming RX packets to the Flex IO RQ. */
-	struct flow_rule *rx_rule;
-	/* TX flow matcher. */
-	struct flow_matcher *tx_matcher;
-	/* TX flow rule for forwarding outgoing TX packets to the SWS rule table. */
-	struct flow_rule *tx_rule_table;
-	/* TX flow rule for forwarding outgoing TX packets to the vport (wire). */
-	struct flow_rule *tx_rule_vport;
-
-	/* Transfer structs with information to pass to DPA side.
-	 * The structs are defined by a common header which both sides may use.
-	 */
-	/* SQ's CQ transfer information. */
-	struct app_transfer_cq sq_cq_transf;
-	/* SQ transfer information. */
-	struct app_transfer_wq sq_transf;
-	/* RQ's CQ transfer information. */
-	struct app_transfer_cq rq_cq_transf;
-	/* RQ transfer information. */
-	struct app_transfer_wq rq_transf;
-
-	/* DPA heap memory address of application information struct.
-	 * Invoked event handler will get this as argument and parse it to the application
-	 * information struct.
-	 */
-	flexio_uintptr_t app_data_daddr;
+	/* Number of DPA threads to create. */
+	int num_threads;
+	/* Per-thread context array (calloc'd, size = num_threads). */
+	struct thread_ctx *threads;
 };
 
 /* Open ibv device
@@ -216,27 +214,32 @@ static struct flexio_mkey *create_dpa_mkey(struct app_context *app_ctx, flexio_u
 	return mkey;
 }
 
-/* Source MAC address to match for incoming packets. */
-#define SMAC 0x02427e7feb02
-/* Creates steering rules for application.
+/* Base source MAC address; thread n matches SMAC = BASE_SMAC + n. */
+#define BASE_SMAC 0x02427e7feb02ULL
+#define THREAD_SMAC(i) (BASE_SMAC + (i))
+
+/* Creates steering rules for a single thread.
  * Returns 0 on success and -1 if the allocation was failed.
- * app_ctx - pointer to app_context structure.
+ * app_ctx  - pointer to app_context structure.
+ * t        - pointer to thread_ctx structure for this thread.
  * nic_mode - if set to 1, the sample runs on ConnectX part.
  */
-static int create_steering_rules(struct app_context *app_ctx, int nic_mode)
+static int create_thread_steering_rules(struct app_context *app_ctx,
+					struct thread_ctx *t, int nic_mode)
 {
+	uint64_t smac = THREAD_SMAC(t->thread_index);
+
 	/* Create RX flow matcher. */
-	app_ctx->rx_matcher = create_matcher_rx(app_ctx->ibv_ctx);
-	if (!app_ctx->rx_matcher) {
+	t->rx_matcher = create_matcher_rx(app_ctx->ibv_ctx);
+	if (!t->rx_matcher) {
 		printf("Failed to create RX matcher\n");
 		return -1;
 	}
 
 	/* Create RX flow rule for the specific source MAC of incoming packets. */
-	app_ctx->rx_rule =
-		create_rule_rx_mac_match(app_ctx->rx_matcher,
-					 flexio_rq_get_tir(app_ctx->flexio_rq_ptr), SMAC);
-	if (!app_ctx->rx_rule) {
+	t->rx_rule = create_rule_rx_mac_match(t->rx_matcher,
+					      flexio_rq_get_tir(t->flexio_rq_ptr), smac);
+	if (!t->rx_rule) {
 		printf("Failed to create RX steering rule\n");
 		return -1;
 	}
@@ -250,22 +253,22 @@ static int create_steering_rules(struct app_context *app_ctx, int nic_mode)
 		 * the DPU to the wire.
 		 */
 		/* Create TX flow matcher. */
-		app_ctx->tx_matcher = create_matcher_tx(app_ctx->ibv_ctx);
-		if (!app_ctx->tx_matcher) {
+		t->tx_matcher = create_matcher_tx(app_ctx->ibv_ctx);
+		if (!t->tx_matcher) {
 			printf("Failed to create TX matcher\n");
 			return -1;
 		}
 
 		/* Create a TX flow rule to forward outgoing packets to SW steering table. */
-		app_ctx->tx_rule_table = create_rule_tx_fwd_to_sws_table(app_ctx->tx_matcher, SMAC);
-		if (!app_ctx->tx_rule_table) {
+		t->tx_rule_table = create_rule_tx_fwd_to_sws_table(t->tx_matcher, smac);
+		if (!t->tx_rule_table) {
 			printf("Failed to create TX table steering rule\n");
 			return -1;
 		}
 
 		/* Create a TX flow rule to forward outgoing packets to vport (wire). */
-		app_ctx->tx_rule_vport = create_rule_tx_fwd_to_vport(app_ctx->tx_matcher, SMAC);
-		if (!app_ctx->tx_rule_vport) {
+		t->tx_rule_vport = create_rule_tx_fwd_to_vport(t->tx_matcher, smac);
+		if (!t->tx_rule_vport) {
 			printf("Failed to create TX vport steering rule\n");
 			return -1;
 		}
@@ -354,9 +357,10 @@ static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 /* Create an SQ over the DPA for sending packets from DPA to wire.
  * A CQ is also created for the SQ.
  * Returns 0 on success and -1 if the allocation fails.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * app_ctx - pointer to app_context structure.
+ * t       - pointer to thread_ctx for this thread.
  */
-static int create_app_sq(struct app_context *app_ctx)
+static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 {
 	/* Pointer to the application Flex IO process (ease of use). */
 	struct flexio_process *app_fp = app_ctx->flexio_process;
@@ -371,7 +375,7 @@ static int create_app_sq(struct app_context *app_ctx)
 	uint32_t cq_num;
 
 	/* Allocate CQ memory (ring and DBR) on DPA heap memory. */
-	if (cq_mem_alloc(app_fp, &app_ctx->sq_cq_transf)) {
+	if (cq_mem_alloc(app_fp, &t->sq_cq_transf)) {
 		printf("Failed to alloc memory for SQ's CQ.\n");
 		return -1;
 	}
@@ -389,25 +393,25 @@ static int create_app_sq(struct app_context *app_ctx)
 	/* Set CQ DBR memory. DBR memory is on the DPA side in order to allow direct access from
 	 * DPA.
 	 */
-	sqcq_attr.cq_dbr_daddr = app_ctx->sq_cq_transf.cq_dbr_daddr;
+	sqcq_attr.cq_dbr_daddr = t->sq_cq_transf.cq_dbr_daddr;
 	/* Set CQ ring memory. Ring memory is on the DPA side in order to allow reading CQEs from
 	 * DPA during packet forwarding.
 	 */
-	sqcq_attr.cq_ring_qmem.daddr = app_ctx->sq_cq_transf.cq_ring_daddr;
+	sqcq_attr.cq_ring_qmem.daddr = t->sq_cq_transf.cq_ring_daddr;
 	/* Create CQ for SQ. */
-	if (flexio_cq_create(app_fp, NULL, &sqcq_attr, &app_ctx->flexio_sq_cq_ptr)) {
+	if (flexio_cq_create(app_fp, NULL, &sqcq_attr, &t->flexio_sq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
 		return -1;
 	}
 
 	/* Fetch SQ's CQ number to communicate to DPA side. */
-	cq_num = flexio_cq_get_cq_num(app_ctx->flexio_sq_cq_ptr);
+	cq_num = flexio_cq_get_cq_num(t->flexio_sq_cq_ptr);
 	/* Set SQ's CQ number in communication struct. */
-	app_ctx->sq_cq_transf.cq_num = cq_num;
+	t->sq_cq_transf.cq_num = cq_num;
 	/* Set SQ's CQ depth in communication struct. */
-	app_ctx->sq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
+	t->sq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
 	/* Allocate SQ memory (ring and data) on DPA heap memory. */
-	if (sq_mem_alloc(app_fp, &app_ctx->sq_transf)) {
+	if (sq_mem_alloc(app_fp, &t->sq_transf)) {
 		printf("Failed to allocate memory for SQ\n");
 		return -1;
 	}
@@ -421,7 +425,7 @@ static int create_app_sq(struct app_context *app_ctx)
 	/* Set SQ ring memory. Ring memory is on the DPA side in order to allow writing WQEs from
 	 * DPA during packet forwarding.
 	 */
-	sq_attr.wq_ring_qmem.daddr = app_ctx->sq_transf.wq_ring_daddr;
+	sq_attr.wq_ring_qmem.daddr = t->sq_transf.wq_ring_daddr;
 
 	/* Set SQ protection domain */
 	sq_attr.pd = app_ctx->process_pd;
@@ -429,22 +433,22 @@ static int create_app_sq(struct app_context *app_ctx)
 	/* Create SQ.
 	 * Second argument is NULL as SQ is created on the same GVMI as the process.
 	 */
-	if (flexio_sq_create(app_fp, NULL, cq_num, &sq_attr, &app_ctx->flexio_sq_ptr)) {
+	if (flexio_sq_create(app_fp, NULL, cq_num, &sq_attr, &t->flexio_sq_ptr)) {
 		printf("Failed to create Flex IO SQ\n");
 		return -1;
 	}
 
 	/* Fetch SQ's number to communicate to DPA side. */
-	app_ctx->sq_transf.wq_num = flexio_sq_get_wq_num(app_ctx->flexio_sq_ptr);
+	t->sq_transf.wq_num = flexio_sq_get_wq_num(t->flexio_sq_ptr);
 
 	/* Create an MKey for SQ data buffer to send. */
-	app_ctx->sqd_mkey = create_dpa_mkey(app_ctx, app_ctx->sq_transf.wqd_daddr);
-	if (!app_ctx->sqd_mkey) {
+	t->sqd_mkey = create_dpa_mkey(app_ctx, t->sq_transf.wqd_daddr);
+	if (!t->sqd_mkey) {
 		printf("Failed to create an MKey for SQ data buffer\n");
 		return -1;
 	}
 	/* Set SQ's data buffer MKey ID in communication struct. */
-	app_ctx->sq_transf.wqd_mkey_id = flexio_mkey_get_id(app_ctx->sqd_mkey);
+	t->sq_transf.wqd_mkey_id = flexio_mkey_get_id(t->sqd_mkey);
 
 	return 0;
 }
@@ -487,14 +491,15 @@ static int rq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
  * RQ WQEs need to be initialized (produced) by SW so they are ready for incoming packets.
  * The WQEs are initialized over temporary host memory and then copied to the DPA.
  * Returns 0 on success and -1 if the allocation fails.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * process   - Flex IO process.
+ * rq_transf - RQ transfer struct with DPA buffer addresses.
  */
-static int init_dpa_rq_ring(struct app_context *app_ctx)
+static int init_dpa_rq_ring(struct flexio_process *process, struct app_transfer_wq *rq_transf)
 {
 	/* RQ WQE data iterator. */
-	flexio_uintptr_t wqe_data_daddr = app_ctx->rq_transf.wqd_daddr;
+	flexio_uintptr_t wqe_data_daddr = rq_transf->wqd_daddr;
 	/* RQ ring MKey. */
-	uint32_t mkey_id = app_ctx->rq_transf.wqd_mkey_id;
+	uint32_t mkey_id = rq_transf->wqd_mkey_id;
 	/* Temporary host memory for RQ ring. */
 	struct mlx5_wqe_data_seg *rx_wqes;
 	/* RQ WQE iterator. */
@@ -520,10 +525,8 @@ static int init_dpa_rq_ring(struct app_context *app_ctx)
 	}
 
 	/* Copy RX WQEs from host to RQ ring DPA heap memory. */
-	if (flexio_host2dev_memcpy(app_ctx->flexio_process, rx_wqes, RQ_RING_BSIZE,
-				   app_ctx->rq_transf.wq_ring_daddr)) {
+	if (flexio_host2dev_memcpy(process, rx_wqes, RQ_RING_BSIZE, rq_transf->wq_ring_daddr))
 		retval = -1;
-	}
 
 	/* Free temporary host memory. */
 	free(rx_wqes);
@@ -531,11 +534,12 @@ static int init_dpa_rq_ring(struct app_context *app_ctx)
 }
 
 /* Initialize RQ's DBR.
- * Receive counter need to be set to number of produces WQEs.
+ * Receive counter need to be set to number of produced WQEs.
  * Returns 0 on success and -1 if the allocation fails.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * process   - Flex IO process.
+ * rq_transf - RQ transfer struct with DPA buffer addresses.
  */
-static int init_rq_dbr(struct app_context *app_ctx)
+static int init_rq_dbr(struct flexio_process *process, struct app_transfer_wq *rq_transf)
 {
 	/* Temporary host memory for DBR value. */
 	__be32 dbr[2];
@@ -545,10 +549,8 @@ static int init_rq_dbr(struct app_context *app_ctx)
 	/* Send counter is not used for RQ so it is nullified. */
 	dbr[1] = htobe32(0);
 	/* Copy DBR value to DPA heap memory.*/
-	if (flexio_host2dev_memcpy(app_ctx->flexio_process, dbr, sizeof(dbr),
-				   app_ctx->rq_transf.wq_dbr_daddr)) {
+	if (flexio_host2dev_memcpy(process, dbr, sizeof(dbr), rq_transf->wq_dbr_daddr))
 		return -1;
-	}
 
 	return 0;
 }
@@ -556,9 +558,10 @@ static int init_rq_dbr(struct app_context *app_ctx)
 /* Create an RQ over the DPA for receiving packets on DPA.
  * A CQ is also created for the RQ.
  * Returns 0 on success and -1 if the allocation fails.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * app_ctx - pointer to app_context structure.
+ * t       - pointer to thread_ctx for this thread.
  */
-static int create_app_rq(struct app_context *app_ctx)
+static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 {
 	/* Pointer to the application Flex IO process (ease of use). */
 	struct flexio_process *app_fp = app_ctx->flexio_process;
@@ -573,7 +576,7 @@ static int create_app_rq(struct app_context *app_ctx)
 	uint32_t cq_num;
 
 	/* Allocate CQ memory (ring and DBR) on DPA heap memory. */
-	if (cq_mem_alloc(app_fp, &app_ctx->rq_cq_transf)) {
+	if (cq_mem_alloc(app_fp, &t->rq_cq_transf)) {
 		printf("Failed to alloc memory for RQ's CQ.\n");
 		return -1;
 	}
@@ -585,8 +588,8 @@ static int create_app_rq(struct app_context *app_ctx)
 	 * This will be used for running the DPA program for each incoming packet on the RQ.
 	 */
 	rqcq_attr.element_type = FLEXIO_CQ_ELEMENT_TYPE_DPA_THREAD;
-	/* Set CQ thread to the application event handler's thread. */
-	rqcq_attr.thread = flexio_event_handler_get_thread(app_ctx->pp_eh);
+	/* Set CQ thread to this thread's event handler thread. */
+	rqcq_attr.thread = flexio_event_handler_get_thread(t->pp_eh);
 	/* Set CQ UAR ID attribute to the Flex IO process UAR ID.
 	 * This will allow updating/arming the CQ from the DPA side.
 	 */
@@ -594,39 +597,39 @@ static int create_app_rq(struct app_context *app_ctx)
 	/* Set CQ DBR memory. DBR memory is on the DPA side in order to allow direct access from
 	 * DPA.
 	 */
-	rqcq_attr.cq_dbr_daddr = app_ctx->rq_cq_transf.cq_dbr_daddr;
+	rqcq_attr.cq_dbr_daddr = t->rq_cq_transf.cq_dbr_daddr;
 	/* Set CQ ring memory. Ring memory is on the DPA side in order to allow reading CQEs from
 	 * DPA during packet forwarding.
 	 */
-	rqcq_attr.cq_ring_qmem.daddr = app_ctx->rq_cq_transf.cq_ring_daddr;
+	rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
 	/* Create CQ for RQ. */
-	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &app_ctx->flexio_rq_cq_ptr)) {
+	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
 		return -1;
 	}
 
-	/* Fetch SQ's CQ number to communicate to DPA side. */
-	cq_num = flexio_cq_get_cq_num(app_ctx->flexio_rq_cq_ptr);
+	/* Fetch RQ's CQ number to communicate to DPA side. */
+	cq_num = flexio_cq_get_cq_num(t->flexio_rq_cq_ptr);
 	/* Set RQ's CQ number in communication struct. */
-	app_ctx->rq_cq_transf.cq_num = cq_num;
+	t->rq_cq_transf.cq_num = cq_num;
 	/* Set RQ's CQ depth in communication struct. */
-	app_ctx->rq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
+	t->rq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
 	/* Allocate RQ memory (ring and data) on DPA heap memory. */
-	if (rq_mem_alloc(app_fp, &app_ctx->rq_transf)) {
+	if (rq_mem_alloc(app_fp, &t->rq_transf)) {
 		printf("Failed to allocate memory for RQ.\n");
 		return -1;
 	}
 
 	/* Create an MKey for RX buffer */
-	app_ctx->rqd_mkey = create_dpa_mkey(app_ctx, app_ctx->rq_transf.wqd_daddr);
-	if (!app_ctx->rqd_mkey) {
+	t->rqd_mkey = create_dpa_mkey(app_ctx, t->rq_transf.wqd_daddr);
+	if (!t->rqd_mkey) {
 		printf("Failed to create an MKey for RQ data buffer.\n");
 		return -1;
 	}
-	/* Set SQ's data buffer MKey ID in communication struct. */
-	app_ctx->rq_transf.wqd_mkey_id = flexio_mkey_get_id(app_ctx->rqd_mkey);
+	/* Set RQ's data buffer MKey ID in communication struct. */
+	t->rq_transf.wqd_mkey_id = flexio_mkey_get_id(t->rqd_mkey);
 	/* Initialize RQ ring. */
-	if (init_dpa_rq_ring(app_ctx)) {
+	if (init_dpa_rq_ring(app_fp, &t->rq_transf)) {
 		printf("Failed to init RQ ring.\n");
 		return -1;
 	}
@@ -638,20 +641,20 @@ static int create_app_rq(struct app_context *app_ctx)
 	/* Set RQ DBR memory type to DPA heap memory. */
 	rq_attr.wq_dbr_qmem.memtype = FLEXIO_MEMTYPE_DPA;
 	/* Set RQ DBR memory address. */
-	rq_attr.wq_dbr_qmem.daddr = app_ctx->rq_transf.wq_dbr_daddr;
+	rq_attr.wq_dbr_qmem.daddr = t->rq_transf.wq_dbr_daddr;
 	/* Set RQ ring memory address. */
-	rq_attr.wq_ring_qmem.daddr = app_ctx->rq_transf.wq_ring_daddr;
+	rq_attr.wq_ring_qmem.daddr = t->rq_transf.wq_ring_daddr;
 	/* Create the Flex IO RQ.
 	 * Second argument is NULL as RQ is created on the same GVMI as the process.
 	 */
-	if (flexio_rq_create(app_fp, NULL, cq_num, &rq_attr, &app_ctx->flexio_rq_ptr)) {
+	if (flexio_rq_create(app_fp, NULL, cq_num, &rq_attr, &t->flexio_rq_ptr)) {
 		printf("Failed to create Flex IO RQ.\n");
 		return -1;
 	}
 
 	/* Fetch RQ's number to communicate to DPA side. */
-	app_ctx->rq_transf.wq_num = flexio_rq_get_wq_num(app_ctx->flexio_rq_ptr);
-	if (init_rq_dbr(app_ctx)) {
+	t->rq_transf.wq_num = flexio_rq_get_wq_num(t->flexio_rq_ptr);
+	if (init_rq_dbr(app_fp, &t->rq_transf)) {
 		printf("Failed to init RQ DBR.\n");
 		return -1;
 	}
@@ -659,27 +662,28 @@ static int create_app_rq(struct app_context *app_ctx)
 	return 0;
 }
 
-/* Creates a Flex IO SDK event handler.
- * The event handler is used for setting a function in the loaded program to run once
- * a proper trigger happens (CQE on the relevant CQ).
+/* Creates a Flex IO SDK event handler for a single thread.
+ * The event handler is pinned to a dedicated EU via FLEXIO_AFFINITY_STRICT so that
+ * the static app_ctxs[thread_index] array on the DPA side is always accessed by the
+ * same EU (no concurrent access, no locking needed).
  * Returns 0 on success and -1 if the allocation fails.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * app_ctx - pointer to app_context structure.
+ * t       - pointer to thread_ctx for this thread.
  */
-static int create_app_event_handler(struct app_context *app_ctx)
+static int create_thread_event_handler(struct app_context *app_ctx, struct thread_ctx *t)
 {
 	/* Event handler creation attributes. */
 	struct flexio_event_handler_attr eh_attr = {0};
 
 	/* Set function stub to the stub created by DPACC and declared in the host application. */
 	eh_attr.host_stub_func = flexio_pp_dev;
-	/* Set execution unit affinity to 'none'.
-	 * This will cause the event handler thread to trigger on any free execution unit.
-	 * This assumes there's at least one available execution unit in the device default
-	 * execution unit group.
+	/* Pin each event handler to a dedicated EU so that array index i is always served by
+	 * EU i, making the device-side static array access safe without locks.
 	 */
-	eh_attr.affinity.type = FLEXIO_AFFINITY_NONE;
+	eh_attr.affinity.type = FLEXIO_AFFINITY_STRICT;
+	eh_attr.affinity.id = t->thread_index;
 	/* Create the Flex IO event handler object. */
-	if (flexio_event_handler_create(app_ctx->flexio_process, &eh_attr, &app_ctx->pp_eh)) {
+	if (flexio_event_handler_create(app_ctx->flexio_process, &eh_attr, &t->pp_eh)) {
 		printf("Failed to create Flex IO event handler\n");
 		return -1;
 	}
@@ -687,13 +691,14 @@ static int create_app_event_handler(struct app_context *app_ctx)
 	return 0;
 }
 
-/* Copy application information to DPA.
+/* Copy per-thread application information to DPA.
  * DPA side needs queue information in order to process the packets.
  * The DPA heap memory address will be passed as the event handler argument.
  * Returns 0 if success and -1 if the copy failed.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * app_ctx - pointer to app_context structure.
+ * t       - pointer to thread_ctx for this thread.
  */
-static int copy_app_data_to_dpa(struct app_context *app_ctx)
+static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ctx *t)
 {
 	/* Size of application information struct. */
 	uint64_t struct_bsize = sizeof(struct host2dev_packet_processor_data);
@@ -710,21 +715,23 @@ static int copy_app_data_to_dpa(struct app_context *app_ctx)
 	}
 
 	/* Set SQ's CQ information. */
-	h2d_data->sq_cq_transf = app_ctx->sq_cq_transf;
+	h2d_data->sq_cq_transf = t->sq_cq_transf;
 	/* Set SQ's information. */
-	h2d_data->sq_transf = app_ctx->sq_transf;
+	h2d_data->sq_transf = t->sq_transf;
 	/* Set RQ's CQ information. */
-	h2d_data->rq_cq_transf = app_ctx->rq_cq_transf;
+	h2d_data->rq_cq_transf = t->rq_cq_transf;
 	/* Set RQ's information. */
-	h2d_data->rq_transf = app_ctx->rq_transf;
+	h2d_data->rq_transf = t->rq_transf;
+	/* Set thread index so DPA selects the correct app_ctxs[] slot. */
+	h2d_data->thread_index = t->thread_index;
 	/* Set APP data info for first run. */
 	h2d_data->not_first_run = 0;
 
 	/* Copy to DPA heap memory.
-	 * Allocated DPA heap memory address will be kept in app_data_daddr.
+	 * Allocated DPA heap memory address will be kept in t->app_data_daddr.
 	 */
 	if (flexio_copy_from_host(app_ctx->flexio_process, h2d_data, struct_bsize,
-				  &app_ctx->app_data_daddr)) {
+				  &t->app_data_daddr)) {
 		printf("Failed to copy application information to DPA.\n");
 		ret = -1;
 	}
@@ -734,40 +741,40 @@ static int copy_app_data_to_dpa(struct app_context *app_ctx)
 	return ret;
 }
 
-/* Clean up previously allocated rules.
- * Returns 0 on success and -1 if the destroy failed.
- * app_ctx - app_ctx - pointer to app_context structure.
+/* Clean up previously allocated steering rules for one thread.
+ * Returns 0 on success and -1 if any destroy failed.
+ * t - pointer to thread_ctx for this thread.
  */
-static int clean_up_rules(struct app_context *app_ctx)
+static int clean_up_thread_rules(struct thread_ctx *t)
 {
 	int err = 0;
 
 	/* Clean up rx rule if created */
-	if (app_ctx->rx_rule && destroy_rule(app_ctx->rx_rule)) {
+	if (t->rx_rule && destroy_rule(t->rx_rule)) {
 		printf("Failed to destroy rx rule\n");
 		err = -1;
 	}
 
 	/* Clean up rx matcher if created */
-	if (app_ctx->rx_matcher && destroy_matcher(app_ctx->rx_matcher)) {
+	if (t->rx_matcher && destroy_matcher(t->rx_matcher)) {
 		printf("Failed to destroy rx matcher\n");
 		err = -1;
 	}
 
 	/* Clean up tx rule for vport if created */
-	if (app_ctx->tx_rule_vport && destroy_rule(app_ctx->tx_rule_vport)) {
+	if (t->tx_rule_vport && destroy_rule(t->tx_rule_vport)) {
 		printf("Failed to destroy tx rule vport\n");
 		err = -1;
 	}
 
 	/* Clean up tx rule for table if created */
-	if (app_ctx->tx_rule_table && destroy_rule(app_ctx->tx_rule_table)) {
+	if (t->tx_rule_table && destroy_rule(t->tx_rule_table)) {
 		printf("Failed to destroy tx rule\n");
 		err = -1;
 	}
 
 	/* Clean up tx matcher if created */
-	if (app_ctx->tx_matcher && destroy_matcher(app_ctx->tx_matcher)) {
+	if (t->tx_matcher && destroy_matcher(t->tx_matcher)) {
 		printf("Failed to destroy tx matcher\n");
 		err = -1;
 	}
@@ -775,59 +782,60 @@ static int clean_up_rules(struct app_context *app_ctx)
 	return err;
 }
 
-/* Clean up previously allocated RQ
+/* Clean up previously allocated RQ for one thread.
  * Returns 0 on success and -1 if the destroy failed.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * app_ctx - pointer to app_context structure.
+ * t       - pointer to thread_ctx for this thread.
  */
-static int clean_up_app_rq(struct app_context *app_ctx)
+static int clean_up_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 {
 	int err = 0;
 
 	/* Clean up rq pointer if created */
-	if (app_ctx->flexio_rq_ptr && flexio_rq_destroy(app_ctx->flexio_rq_ptr)) {
+	if (t->flexio_rq_ptr && flexio_rq_destroy(t->flexio_rq_ptr)) {
 		printf("Failed to destroy RQ\n");
 		err = -1;
 	}
 
 	/* Clean up memory key for rqd if created */
-	if (app_ctx->rqd_mkey && flexio_device_mkey_destroy(app_ctx->rqd_mkey)) {
+	if (t->rqd_mkey && flexio_device_mkey_destroy(t->rqd_mkey)) {
 		printf("Failed to destroy mkey RQD\n");
 		err = -1;
 	}
 
-	/* Clean up app data daddr if created */
-	if (app_ctx->rq_transf.wq_dbr_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->rq_transf.wq_dbr_daddr)) {
+	/* Clean up DBR daddr if created */
+	if (t->rq_transf.wq_dbr_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wq_dbr_daddr)) {
 		printf("Failed to free rq_transf.wq_dbr_daddr\n");
 		err = -1;
 	}
 
 	/* Clean up wq_ring_daddr for rq_transf if created */
-	if (app_ctx->rq_transf.wq_ring_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->rq_transf.wq_ring_daddr)) {
+	if (t->rq_transf.wq_ring_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wq_ring_daddr)) {
 		printf("Failed to free rq_transf.wq_ring_daddr\n");
 		err = -1;
 	}
 
-	if (app_ctx->rq_transf.wqd_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->rq_transf.wqd_daddr)) {
+	if (t->rq_transf.wqd_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wqd_daddr)) {
 		printf("Failed to free rq_transf.wqd_daddr\n");
 		err = -1;
 	}
 
-	if (app_ctx->flexio_rq_cq_ptr && flexio_cq_destroy(app_ctx->flexio_rq_cq_ptr)) {
-		printf("Failed to destroy RQ' CQ\n");
+	if (t->flexio_rq_cq_ptr && flexio_cq_destroy(t->flexio_rq_cq_ptr)) {
+		printf("Failed to destroy RQ CQ\n");
 		err = -1;
 	}
 
-	if (app_ctx->rq_cq_transf.cq_ring_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->rq_cq_transf.cq_ring_daddr)) {
+	if (t->rq_cq_transf.cq_ring_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_cq_transf.cq_ring_daddr)) {
 		printf("Failed to free rq_cq_transf.cq_ring_daddr\n");
 		err = -1;
 	}
 
-	if (app_ctx->rq_cq_transf.cq_dbr_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->rq_cq_transf.cq_dbr_daddr)) {
+	if (t->rq_cq_transf.cq_dbr_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_cq_transf.cq_dbr_daddr)) {
 		printf("Failed to free rq_cq_transf.cq_dbr_daddr\n");
 		err = -1;
 	}
@@ -835,49 +843,50 @@ static int clean_up_app_rq(struct app_context *app_ctx)
 	return err;
 }
 
-/* Clean up previously allocated SQ
+/* Clean up previously allocated SQ for one thread.
  * Returns 0 on success and -1 if the destroy failed.
- * app_ctx - app_ctx - pointer to app_context structure.
+ * app_ctx - pointer to app_context structure.
+ * t       - pointer to thread_ctx for this thread.
  */
-static int clean_up_app_sq(struct app_context *app_ctx)
+static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 {
 	int err = 0;
 
-	if (app_ctx->flexio_sq_ptr && flexio_sq_destroy(app_ctx->flexio_sq_ptr)) {
+	if (t->flexio_sq_ptr && flexio_sq_destroy(t->flexio_sq_ptr)) {
 		printf("Failed to destroy SQ\n");
 		err = -1;
 	}
 
-	if (app_ctx->sqd_mkey && flexio_device_mkey_destroy(app_ctx->sqd_mkey)) {
+	if (t->sqd_mkey && flexio_device_mkey_destroy(t->sqd_mkey)) {
 		printf("Failed to destroy mkey SQD\n");
 		err = -1;
 	}
 
-	if (app_ctx->sq_transf.wq_ring_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->sq_transf.wq_ring_daddr)) {
+	if (t->sq_transf.wq_ring_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wq_ring_daddr)) {
 		printf("Failed to free sq_transf.wq_ring_daddr\n");
 		err = -1;
 	}
 
-	if (app_ctx->sq_transf.wqd_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->sq_transf.wqd_daddr)) {
+	if (t->sq_transf.wqd_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wqd_daddr)) {
 		printf("Failed to free sq_transf.wqd_daddr\n");
 		err = -1;
 	}
 
-	if (app_ctx->flexio_sq_cq_ptr && flexio_cq_destroy(app_ctx->flexio_sq_cq_ptr)) {
-		printf("Failed to destroy SQ' CQ\n");
+	if (t->flexio_sq_cq_ptr && flexio_cq_destroy(t->flexio_sq_cq_ptr)) {
+		printf("Failed to destroy SQ CQ\n");
 		err = -1;
 	}
 
-	if (app_ctx->sq_cq_transf.cq_ring_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->sq_cq_transf.cq_ring_daddr)) {
+	if (t->sq_cq_transf.cq_ring_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_cq_transf.cq_ring_daddr)) {
 		printf("Failed to free sq_cq_transf.cq_ring_daddr\n");
 		err = -1;
 	}
 
-	if (app_ctx->sq_cq_transf.cq_dbr_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, app_ctx->sq_cq_transf.cq_dbr_daddr)) {
+	if (t->sq_cq_transf.cq_dbr_daddr &&
+	    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_cq_transf.cq_dbr_daddr)) {
 		printf("Failed to free sq_cq_transf.cq_dbr_daddr\n");
 		err = -1;
 	}
@@ -911,6 +920,10 @@ int main(int argc, char **argv)
 	uint64_t udbg_token;
 	/* Mode of working - for nic (host) or for dpu (default) */
 	int nic_mode = 0;
+	/* Number of DPA threads to create (default 1 for backward compatibility) */
+	uint32_t num_threads = 1;
+	/* Loop index */
+	int i;
 	/* Buffer for fread */
 	char buf[2];
 	/* Execution status value. */
@@ -918,19 +931,39 @@ int main(int argc, char **argv)
 
 	printf("Welcome to 'Flex IO SDK packet processing' sample app.\n");
 
-	/* Check input includes a device name. */
-	if ((argc < 2) || (argc > 3)) {
-		printf("Usage: %s <mlx5 device> [--nic-mode]\n", argv[0]);
+	/* Check input includes at least a device name. */
+	if (argc < 2) {
+		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N]\n", argv[0]);
 		return -1;
 	}
 
-	if (argc == 3) {
-		if (strcmp(argv[2], "--nic-mode")) {
-			printf("Invalid second parameter %s\n", argv[2]);
+	/* Parse optional arguments. */
+	for (i = 2; i < argc; ) {
+		if (!strcmp(argv[i], "--nic-mode")) {
+			nic_mode = 1;
+			i++;
+		} else if (!strcmp(argv[i], "--threads")) {
+			char *endptr;
+			unsigned long val;
+
+			if (i + 1 >= argc) {
+				printf("--threads requires a value\n");
+				return -1;
+			}
+			val = strtoul(argv[i + 1], &endptr, 10);
+			if (!endptr || *endptr || val == 0 || val > APP_MAX_DPA_THREADS) {
+				printf("--threads value must be 1..%d\n", APP_MAX_DPA_THREADS);
+				return -1;
+			}
+			num_threads = (uint32_t)val;
+			i += 2;
+		} else {
+			printf("Unknown argument: %s\n", argv[i]);
+			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N]\n", argv[0]);
 			return -1;
 		}
-		nic_mode = 1;
 	}
+	app_ctx.num_threads = (int)num_threads;
 
 	/* Check if the application run with root privileges */
 	if (geteuid()) {
@@ -1030,54 +1063,69 @@ int main(int argc, char **argv)
 	app_ctx.process_pd = flexio_process_get_pd(app_fp);
 	app_ctx.process_uar = flexio_process_get_uar(app_fp);
 
-	/* Create an event handler. */
-	if (create_app_event_handler(&app_ctx)) {
-		printf("Failed to create Flex IO event handler.\n");
+	/* Allocate per-thread context array. calloc ensures all fields start as zero/NULL. */
+	app_ctx.threads = calloc(app_ctx.num_threads, sizeof(struct thread_ctx));
+	if (!app_ctx.threads) {
+		printf("Failed to allocate thread context array.\n");
 		err = -1;
 		goto cleanup;
 	}
 
-	/* Create a Flex IO SQ to send packets from the DPA. */
-	if (create_app_sq(&app_ctx)) {
-		printf("Failed to create Flex SQ.\n");
-		err = -1;
-		goto cleanup;
-	}
+	/* Initialize all per-thread resources. */
+	for (i = 0; i < app_ctx.num_threads; i++) {
+		struct thread_ctx *t = &app_ctx.threads[i];
 
-	/* Create a Flex IO RQ to receive packets on the DPA.
-	 * CQEs for received packets will trigger the packet processing event handler.
-	 */
-	if (create_app_rq(&app_ctx)) {
-		printf("Failed to create Flex EQ.\n");
-		err = -1;
-		goto cleanup;
-	}
+		t->thread_index = (uint32_t)i;
 
-	/* Create steering rules. */
-	if (create_steering_rules(&app_ctx, nic_mode)) {
-		printf("Failed to create Flex IO steering rules.\n");
-		err = -1;
-		goto cleanup;
-	}
+		/* Create an event handler pinned to EU i (FLEXIO_AFFINITY_STRICT). */
+		if (create_thread_event_handler(&app_ctx, t)) {
+			printf("Failed to create event handler for thread %d.\n", i);
+			err = -1;
+			goto cleanup;
+		}
 
-	/* Copy the relevant information to DPA. */
-	if (copy_app_data_to_dpa(&app_ctx)) {
-		printf("Failed to copy application data to DPA.\n");
-		err = -1;
-		goto cleanup;
+		/* Create an SQ for this thread. */
+		if (create_thread_sq(&app_ctx, t)) {
+			printf("Failed to create SQ for thread %d.\n", i);
+			err = -1;
+			goto cleanup;
+		}
+
+		/* Create an RQ for this thread (RQ-CQ is linked to this thread's event handler). */
+		if (create_thread_rq(&app_ctx, t)) {
+			printf("Failed to create RQ for thread %d.\n", i);
+			err = -1;
+			goto cleanup;
+		}
+
+		/* Create steering rules matching SMAC = BASE_SMAC + i for this thread. */
+		if (create_thread_steering_rules(&app_ctx, t, nic_mode)) {
+			printf("Failed to create steering rules for thread %d.\n", i);
+			err = -1;
+			goto cleanup;
+		}
+
+		/* Copy queue descriptors and thread_index to DPA heap. */
+		if (copy_thread_data_to_dpa(&app_ctx, t)) {
+			printf("Failed to copy application data for thread %d.\n", i);
+			err = -1;
+			goto cleanup;
+		}
 	}
 
 	printf("Ready to receive messages\n");
 
-	/* Start event handler - move from the init state to the running state.
+	/* Start all event handlers. Two-phase: create all resources first, then run.
 	 * Event handlers in the running state may be invoked by an incoming CQE.
-	 * On other states, the invocation is blocked and lost.
-	 * Pass the address of common information as a user argument to be used on the DPA side.
 	 */
-	if (flexio_event_handler_run(app_ctx.pp_eh, app_ctx.app_data_daddr)) {
-		printf("Failed to run event handler.\n");
-		err = -1;
-		goto cleanup;
+	for (i = 0; i < app_ctx.num_threads; i++) {
+		struct thread_ctx *t = &app_ctx.threads[i];
+
+		if (flexio_event_handler_run(t->pp_eh, t->app_data_daddr)) {
+			printf("Failed to run event handler for thread %d.\n", i);
+			err = -1;
+			goto cleanup;
+		}
 	}
 
 	/* Wait for Enter - the DPA sample is running in the meanwhile */
@@ -1090,33 +1138,48 @@ cleanup:
 	 * that won't allow destroying resources that has references to existing resources.
 	 */
 
-	/* Clean up app data daddr if created */
-	if (app_ctx.app_data_daddr &&
-	    flexio_buf_dev_free(app_fp, app_ctx.app_data_daddr)) {
-		printf("Failed to dealloc application data memory on Flex IO heap\n");
-		err = -1;
-	}
+	if (app_ctx.threads) {
+		/* Free DPA heap memory for all thread descriptors (reverse order). */
+		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
+			struct thread_ctx *t = &app_ctx.threads[i];
 
-	/* Clean up previously created rules */
-	if (clean_up_rules(&app_ctx)) {
-		err = -1;
-	}
+			if (t->app_data_daddr &&
+			    flexio_buf_dev_free(app_fp, t->app_data_daddr)) {
+				printf("Failed to dealloc app data for thread %d\n", i);
+				err = -1;
+			}
+		}
 
-	/* Clean up previously allocated SQ */
-	if (clean_up_app_sq(&app_ctx)) {
-		err = -1;
-	}
+		/* Destroy steering rules (reverse order). */
+		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
+			if (clean_up_thread_rules(&app_ctx.threads[i]))
+				err = -1;
+		}
 
-	/* Clean up previously allocated RQ */
-	if (clean_up_app_rq(&app_ctx)) {
-		err = -1;
-	}
+		/* Destroy SQ resources (reverse order). */
+		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
+			if (clean_up_thread_sq(&app_ctx, &app_ctx.threads[i]))
+				err = -1;
+		}
 
-	/* Destroy event handler if created */
-	if (app_ctx.pp_eh &&
-	    flexio_event_handler_destroy(app_ctx.pp_eh)) {
-		printf("Failed to destroy event handler\n");
-		err = -1;
+		/* Destroy RQ resources (reverse order). */
+		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
+			if (clean_up_thread_rq(&app_ctx, &app_ctx.threads[i]))
+				err = -1;
+		}
+
+		/* Destroy event handlers (reverse order). */
+		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
+			struct thread_ctx *t = &app_ctx.threads[i];
+
+			if (t->pp_eh && flexio_event_handler_destroy(t->pp_eh)) {
+				printf("Failed to destroy event handler for thread %d\n", i);
+				err = -1;
+			}
+		}
+
+		free(app_ctx.threads);
+		app_ctx.threads = NULL;
 	}
 
 	/* Destroy message stream if created */

@@ -47,6 +47,9 @@
 /* Size of WQD is (1 << LOG_WQD_CHUNK_BSIZE) */
 #define LOG_WQD_CHUNK_BSIZE 11
 
+/* Maximum number of independent DPA threads supported. */
+#define APP_MAX_DPA_THREADS 190
+
 /* Structure for transfer CQ data */
 struct app_transfer_cq {
 	/* CQ number */
@@ -83,7 +86,9 @@ struct host2dev_packet_processor_data {
 	struct app_transfer_cq sq_cq_transf;
 	/* SQ transfer information. */
 	struct app_transfer_wq sq_transf;
-	uint8_t not_first_run;
+	uint32_t thread_index;   /* Index into device-side app_ctxs[] */
+	uint8_t  not_first_run;
+	uint8_t  rsvd[3];
 } __attribute__((__packed__, aligned(8)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */
