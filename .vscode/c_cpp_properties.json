@@ -1,0 +1,26 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/opt/mellanox/**"
+            ],
+            "defines": [
+                "__dpa_global__=",
+                "__dpa_device__=",
+                "__dpa_shared__=",
+                "__dpa_rpc__=",
+                "__DPA_MEMORY=0",
+                "__DPA_W=0",
+                "__DPA_R=0",
+                "__DPA_RW=0"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-arm64"
+        }
+    ],
+    "version": 4
+}
