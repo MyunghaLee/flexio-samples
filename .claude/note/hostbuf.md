@@ -338,3 +338,51 @@ The window ID comes from `flexio_window_get_id(app_ctx.window)`.
 ### NOT used: mlx5dv_devx_umem_reg
 Only needed when passing memory to `flexio_qmem` structs (WQ ring/DBR in host memory).
 Since we keep WQ rings on DPA, we use only `ibv_reg_mr()` for data buffer mkeys.
+
+---
+
+## 10. Fixes Applied (forwarding was not working)
+
+Reference: `.claude/ref/flexio-samples_tkhan/packet_processor/`
+
+### Root causes identified
+
+**1. Missing `daddr_on_host` field in `app_transfer_wq`**
+The reference uses `uint8_t daddr_on_host` to tell the DPA side whether the data buffer
+is in host memory or DPA memory. Without this, the device side has no way to decide
+whether to do window-based host address translation vs direct DPA pointer access.
+- Added `daddr_on_host` to `app_transfer_wq` struct in `flexio_packet_processor_com.h`
+- Host sets `daddr_on_host = 1` for both RQ and SQ in `sq_mem_alloc()` / `rq_mem_alloc()`
+
+**2. No error checking on window config/acquire (device side)**
+The original code called `flexio_dev_window_config()` and `flexio_dev_window_ptr_acquire()`
+without checking return values. If either fails, the DPA base pointers remain 0 (from
+static initialization), causing all packet reads/writes to go to wrong addresses.
+- Added `map_host_buffers()` function (matching reference) that checks
+  `FLEXIO_DEV_STATUS_SUCCESS` on every call and reschedules on failure.
+
+**3. Unconditional `flexio_dev_print` in packet loop (device side)**
+The original code called `flexio_dev_print("Process packet: %ld\n", ...)` on every
+single packet in synchronous message stream mode. This blocks the DPA thread waiting
+for host-side message stream consumption, slowing forwarding significantly or stalling it.
+- Removed the unconditional print. Reference only prints when `debug_enable` is on.
+
+**4. MR access flags too restrictive (host side)**
+Original: `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE`
+Fixed:    `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC`
+The reference uses all four flags. `REMOTE_READ` may be needed for NIC DMA-read of
+SQ packet data from host memory.
+
+### Code structure changes (device side, aligned with reference)
+
+- Renamed `sq_lkey` → `lkey`, `rq_lkey` stays `rq_lkey` (matches reference naming)
+- Added `rq_on_host` / `sq_on_host` flags read from `daddr_on_host`
+- Renamed `rqd_haddr_base`/`sqd_haddr_base` → `rq_host_base`/`sq_host_base`
+- Renamed `rqd_dpa_base`/`sqd_dpa_base` → `rq_dpa_base`/`sq_dpa_base`
+- Added `rq_host_to_dpa()` / `sq_host_to_dpa()` helper functions
+- Uses `get_next_dte()` instead of manual `dt_ctx.tx_buff_idx++` computation
+- Window writeback is now conditional: `if (app_ctx.sq_on_host) __dpa_thread_window_writeback()`
+- `packets_count++` moved after `process_packet()` (matches reference)
+- DPA bases initialized to host bases in `app_ctx_init()` — overwritten by
+  `map_host_buffers()` when on host. This lets the same code path work for DPA-memory
+  mode too (no window mapping needed, addresses used directly).

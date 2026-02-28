@@ -203,7 +203,8 @@ static struct ibv_mr *reg_host_mr(struct ibv_pd *pd, void *buf, size_t len)
 	struct ibv_mr *mr;
 
 	mr = ibv_reg_mr(pd, buf, len,
-			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+			IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
 	if (!mr)
 		printf("Failed to register host MR\n");
 
@@ -347,6 +348,8 @@ static int sq_mem_alloc(struct app_context *app_ctx)
 	app_ctx->sq_transf.wqd_daddr = (flexio_uintptr_t)app_ctx->sq_data_hbuf;
 	/* Store ibv lkey as mkey_id used in SQ WQEs and DPA window config. */
 	app_ctx->sq_transf.wqd_mkey_id = app_ctx->sqd_mr->lkey;
+	/* Mark data buffer as residing in host memory. */
+	app_ctx->sq_transf.daddr_on_host = 1;
 
 	/* SQ ring stays on DPA heap for low-latency WQE access. */
 	flexio_buf_dev_alloc(app_ctx->flexio_process, SQ_RING_BSIZE,
@@ -476,6 +479,8 @@ static int rq_mem_alloc(struct app_context *app_ctx)
 	app_ctx->rq_transf.wqd_daddr = (flexio_uintptr_t)app_ctx->rq_data_hbuf;
 	/* Store ibv lkey as mkey_id used in RQ WQEs and DPA window config. */
 	app_ctx->rq_transf.wqd_mkey_id = app_ctx->rqd_mr->lkey;
+	/* Mark data buffer as residing in host memory. */
+	app_ctx->rq_transf.daddr_on_host = 1;
 
 	/* RQ ring stays on DPA heap. */
 	flexio_buf_dev_alloc(app_ctx->flexio_process, RQ_RING_BSIZE,

@@ -73,6 +73,8 @@ struct app_transfer_wq {
  * or DPA heap address when buffer is in DPA memory.
  */
 	flexio_uintptr_t wqd_daddr;
+	/* WQ data memory location (0=DPA memory, 1=host memory). */
+	uint8_t daddr_on_host;
 } __attribute__((__packed__, aligned(8)));
 
 /* Collateral structure for transfer host data to device */
