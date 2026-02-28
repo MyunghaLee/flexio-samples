@@ -59,14 +59,26 @@
 static struct {
 	/* Packet count - used for debug message */
 	uint64_t packets_count;
-	/* lkey - local memory key */
-	uint32_t lkey;
+	/* ibv lkey for SQ host data buffer; placed in SQ WQE data segments. */
+	uint32_t sq_lkey;
+	/* ibv lkey for RQ host data buffer; used to configure window entity 0. */
+	uint32_t rq_lkey;
+	/* FlexIO window ID for host memory access. */
+	uint32_t window_id;
+	/* Host VA base of RQ data buffer (packets land here). */
+	uint64_t rqd_haddr_base;
+	/* Host VA base of SQ data buffer (modified packets written here). */
+	uint64_t sqd_haddr_base;
+	/* DPA-accessible VA base of RQ buffer (set per handler invocation via window). */
+	flexio_uintptr_t rqd_dpa_base;
+	/* DPA-accessible VA base of SQ buffer (set per handler invocation via window). */
+	flexio_uintptr_t sqd_dpa_base;
 
 	cq_ctx_t rq_cq_ctx;     /* RQ CQ */
 	rq_ctx_t rq_ctx;        /* RQ */
 	sq_ctx_t sq_ctx;        /* SQ */
 	cq_ctx_t sq_cq_ctx;     /* SQ CQ */
-	dt_ctx_t dt_ctx;        /* SQ Data ring */
+	dt_ctx_t dt_ctx;        /* SQ Data ring (tx_buff_idx counter only) */
 } app_ctx;
 
 /* Initialize the app_ctx structure from the host data.
@@ -75,7 +87,19 @@ static struct {
 static void app_ctx_init(struct host2dev_packet_processor_data *data_from_host)
 {
 	app_ctx.packets_count = 0;
-	app_ctx.lkey = data_from_host->sq_transf.wqd_mkey_id;
+
+	/* ibv lkeys for host data buffers (used in WQEs and window config). */
+	app_ctx.sq_lkey = data_from_host->sq_transf.wqd_mkey_id;
+	app_ctx.rq_lkey = data_from_host->rq_transf.wqd_mkey_id;
+
+	/* FlexIO window ID for host memory address translation. */
+	app_ctx.window_id = data_from_host->window_id;
+
+	/* Host VA bases of packet data buffers.
+	 * wqd_daddr holds the host virtual address when buffers are in host memory.
+	 */
+	app_ctx.rqd_haddr_base = data_from_host->rq_transf.wqd_daddr;
+	app_ctx.sqd_haddr_base = data_from_host->sq_transf.wqd_daddr;
 
 	/* Set context for RQ's CQ */
 	com_cq_ctx_init(&app_ctx.rq_cq_ctx,
@@ -102,23 +126,36 @@ static void app_ctx_init(struct host2dev_packet_processor_data *data_from_host)
 			data_from_host->sq_cq_transf.cq_ring_daddr,
 			data_from_host->sq_cq_transf.cq_dbr_daddr);
 
-	/* Set context for data */
+	/* dt_ctx used only for tx_buff_idx counter; sq_tx_buff not dereferenced directly. */
 	com_dt_ctx_init(&app_ctx.dt_ctx, data_from_host->sq_transf.wqd_daddr);
 }
 
-/* process packet - read it, swap MAC addresses, modify it, create a send WQE and send it back. */
+/* process packet - read from host RQ buffer, swap MACs, modify, send via host SQ buffer.
+ *
+ * Packet data lives in host memory. The DPA accesses it via FlexIO window:
+ *   - Window entity 0: RQ data buffer (rq_lkey)
+ *   - Window entity 1: SQ data buffer (sq_lkey)
+ * Both window bases (rqd_dpa_base, sqd_dpa_base) are acquired once per handler
+ * invocation in flexio_pp_dev() before this function is called.
+ */
 static void process_packet(void)
 {
 	/* RX packet handling variables */
 	struct flexio_dev_wqe_rcv_data_seg *rwqe;
 	/* RQ WQE index */
 	uint32_t rq_wqe_idx;
-	/* Pointer to RQ data */
+	/* Host VA of received packet (from WQE addr field) */
+	uint64_t rq_haddr;
+	/* DPA-accessible pointer to received packet (via window entity 0) */
 	char *rq_data;
 
 	/* TX packet handling variables */
 	union flexio_dev_sqe_seg *swqe;
-	/* Pointer to SQ data */
+	/* SQ TX slot index */
+	uint32_t tx_idx;
+	/* Host VA of SQ TX slot (placed in SQ WQE for NIC DMA-read) */
+	uint64_t sq_haddr;
+	/* DPA-accessible pointer to SQ TX slot (via window entity 1) */
 	char *sq_data;
 
 	/* Size of the data */
@@ -131,50 +168,61 @@ static void process_packet(void)
 	/* Get the RQ WQE pointed to by the CQE */
 	rwqe = &app_ctx.rq_ctx.rq_ring[rq_wqe_idx & RQ_IDX_MASK];
 
-	/* Extract data (whole packet) pointed to by the RQ WQE */
-	rq_data = flexio_dev_rwqe_get_addr(rwqe);
+	/* WQE addr field holds the host VA of the RQ data slot.
+	 * Translate to a DPA-accessible pointer using the pre-configured window base.
+	 */
+	rq_haddr = (uint64_t)flexio_dev_rwqe_get_addr(rwqe);
+	rq_data = (char *)(app_ctx.rqd_dpa_base + (rq_haddr - app_ctx.rqd_haddr_base));
 
-	/* Take the next entry from the data ring */
-	sq_data = get_next_dte(&app_ctx.dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+	/* Compute the next SQ TX slot (round-robin through the data ring). */
+	tx_idx = app_ctx.dt_ctx.tx_buff_idx++ & DATA_IDX_MASK;
+	sq_haddr = app_ctx.sqd_haddr_base + ((uint64_t)tx_idx << LOG_WQD_CHUNK_BSIZE);
+	sq_data  = (char *)(app_ctx.sqd_dpa_base + ((uint64_t)tx_idx << LOG_WQD_CHUNK_BSIZE));
 
-	/* Copy received packet to sq_data as is */
+	/* Copy received packet into the host SQ TX buffer via window (MMIO write). */
 	memcpy(sq_data, rq_data, data_sz);
 
-	/* swap mac address */
+	/* Swap MAC addresses. */
 	swap_macs(sq_data);
 
-	/* Primitive validation, that packet is our hardcoded */
+	/* Primitive validation: packet is the hardcoded 65-byte test packet. */
 	if (data_sz == 65) {
-		/* modify UDP payload */
+		/* Modify UDP payload */
 		memcpy(sq_data + 0x2a, "  Event demo***************", 65 - 0x2a);
-
-		/* Set hexadecimal value by the index */
+		/* Set a hex digit by index for tracing */
 		sq_data[0x2a] = "0123456789abcdef"[app_ctx.dt_ctx.tx_buff_idx & 0xf];
 	}
 
-	/* Take first segment for SQ WQE (3 segments will be used) */
-	swqe = get_next_sqe(&app_ctx.sq_ctx, SQ_IDX_MASK);
+	/* Build SQ WQE (4 segments). */
 
-	/* Fill out 1-st segment (Control) */
+	/* 1st segment: Control */
+	swqe = get_next_sqe(&app_ctx.sq_ctx, SQ_IDX_MASK);
 	flexio_dev_swqe_seg_ctrl_set(swqe, app_ctx.sq_ctx.sq_pi, app_ctx.sq_ctx.sq_number,
 				     FLEXIO_CTRL_SEG_CE_CQE_ON_CQE_ERROR,
 				     FLEXIO_CTRL_SEG_TYPE_SEND_EN);
 
-	/* Fill out 2-nd segment (Ethernet) */
+	/* 2nd segment: Ethernet inline header */
 	swqe = get_next_sqe(&app_ctx.sq_ctx, SQ_IDX_MASK);
 	flexio_dev_swqe_seg_eth_set(swqe, 0, 0, 0, NULL);
 
-	/* Fill out 3-rd segment (Data) */
+	/* 3rd segment: Data pointer — uses HOST VA + ibv lkey so NIC can DMA-read. */
 	swqe = get_next_sqe(&app_ctx.sq_ctx, SQ_IDX_MASK);
-	flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, app_ctx.lkey, (uint64_t)sq_data);
+	flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, app_ctx.sq_lkey, sq_haddr);
 
-	/* Send WQE is 4 WQEBBs need to skip the 4-th segment */
+	/* 4th segment: padding (SQ WQE is 4 WQEBBs). */
 	swqe = get_next_sqe(&app_ctx.sq_ctx, SQ_IDX_MASK);
 
-	/* Ring DB */
+	/* Flush writes to host SQ buffer through window before ringing the doorbell.
+	 * This ensures the NIC sees the packet data when it reads the SQ WQE.
+	 */
+	__dpa_thread_window_writeback();
+
+	/* Order SQ WQE write (DPA memory) relative to the doorbell write. */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	flexio_dev_qp_sq_ring_db(++app_ctx.sq_ctx.sq_pi, app_ctx.sq_ctx.sq_number);
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
+
+	/* Advance RQ producer index so NIC can reuse this WQE slot. */
 	flexio_dev_dbr_rq_inc_pi(app_ctx.rq_ctx.rq_dbr);
 }
 
@@ -187,31 +235,44 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 {
 	struct host2dev_packet_processor_data *data_from_host = (void *)thread_arg;
 
-	/* If the thread is executed for first time, then initialize the context
-	 */
+	/* Initialize context on first invocation. */
 	if (!data_from_host->not_first_run) {
 		app_ctx_init(data_from_host);
 		data_from_host->not_first_run = 1;
 	}
 
-	/* Poll CQ until the package is received.
+	/* Configure FlexIO window entities for host memory access.
+	 *
+	 * The window mkey must be (re-)configured on every handler invocation
+	 * because the thread context window state resets between invocations.
+	 *
+	 * Entity 0: RQ data buffer (NIC writes received packets here).
+	 * Entity 1: SQ data buffer (DPA writes modified packets here for NIC TX).
 	 */
+	flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_0,
+				 (uint16_t)app_ctx.window_id, app_ctx.rq_lkey);
+	flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0,
+				      app_ctx.rqd_haddr_base, &app_ctx.rqd_dpa_base);
+
+	flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_1,
+				 (uint16_t)app_ctx.window_id, app_ctx.sq_lkey);
+	flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_1,
+				      app_ctx.sqd_haddr_base, &app_ctx.sqd_dpa_base);
+
+	/* Poll CQ until all pending packets are processed. */
 	while (flexio_dev_cqe_get_owner(app_ctx.rq_cq_ctx.cqe) !=
 	       app_ctx.rq_cq_ctx.cq_hw_owner_bit) {
-		/* Print the message */
 		flexio_dev_print("Process packet: %ld\n", app_ctx.packets_count++);
-		/* Update memory to DPA */
+		/* Ensure CQE data is visible before reading packet data. */
 		__dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
-		/* Process the packet */
 		process_packet();
-		/* Update RQ CQ */
 		com_step_cq(&app_ctx.rq_cq_ctx);
 	}
-	/* Update the memory to the chip */
+
+	/* Ensure all DPA memory writes are visible before arming CQ. */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
-	/* Arming cq for next packet */
+	/* Re-arm CQ to trigger on next incoming packet. */
 	flexio_dev_cq_arm(app_ctx.rq_cq_ctx.cq_idx, app_ctx.rq_cq_ctx.cq_number);
 
-	/* Reschedule the thread */
 	flexio_dev_thread_reschedule();
 }
