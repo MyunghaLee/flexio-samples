@@ -72,7 +72,9 @@ struct app_transfer_wq {
 	flexio_uintptr_t wq_ring_daddr;
 	/* WQ ring DBR address */
 	flexio_uintptr_t wq_dbr_daddr;
-	/* WQ data address */
+	/* WQ data address: holds host virtual address when buffer is in host memory,
+ * or DPA heap address when buffer is in DPA memory.
+ */
 	flexio_uintptr_t wqd_daddr;
 } __attribute__((__packed__, aligned(8)));
 
@@ -87,8 +89,10 @@ struct host2dev_packet_processor_data {
 	/* SQ transfer information. */
 	struct app_transfer_wq sq_transf;
 	uint32_t thread_index;   /* Index into device-side app_ctxs[] */
+	/* FlexIO window ID for DPA access to host memory buffers. */
+	uint32_t window_id;
 	uint8_t  not_first_run;
-	uint8_t  rsvd[3];
+	uint8_t  rsvd[7];
 } __attribute__((__packed__, aligned(8)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */

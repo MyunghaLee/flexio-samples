@@ -81,6 +81,17 @@ struct thread_ctx {
 	struct flexio_rq   *flexio_rq_ptr;
 	struct flexio_mkey *rqd_mkey;
 
+    /* Host memory buffer for SQ packet data (64-byte aligned). */
+	void *sq_data_hbuf;
+	/* Host memory buffer for RQ packet data (64-byte aligned). */
+	void *rq_data_hbuf;
+	/* IBV MR for SQ data buffer. mr->lkey used as mkey_id in WQEs. */
+	struct ibv_mr *sqd_mr;
+	/* IBV MR for RQ data buffer. mr->lkey used as mkey_id in WQEs. */
+	struct ibv_mr *rqd_mr;
+	/* FlexIO window for DPA access to host memory data buffers. */
+	struct flexio_window *window;
+
 	/* Transfer descriptors */
 	struct app_transfer_cq sq_cq_transf;
 	struct app_transfer_wq sq_transf;
@@ -184,34 +195,22 @@ cleanup:
 /* SQ/RQ DATA byte size is queue depth times entry byte size. */
 #define Q_DATA_BSIZE Q_DEPTH *Q_DATA_ENTRY_BSIZE
 
-/* Creates an MKey with proper permissions for access from DPA.
- * For this application, we only need memory write access.
- * Returns pointer to flexio_mkey structure on success. Otherwise, returns NULL.
- * app_ctx - pointer to app_context structure.
- * daddr - address of MKEY data.
+/* Registers a host memory buffer with the NIC for DMA access.
+ * Returns pointer to ibv_mr on success. Otherwise, returns NULL.
+ * pd  - IBV protection domain.
+ * buf - host virtual address (must be 64-byte aligned).
+ * len - byte length of the buffer.
  */
-static struct flexio_mkey *create_dpa_mkey(struct app_context *app_ctx, flexio_uintptr_t daddr)
+static struct ibv_mr *reg_host_mr(struct ibv_pd *pd, void *buf, size_t len)
 {
-	/* Flex IO MKey attributes. */
-	struct flexio_mkey_attr mkey_attr = {0};
-	/* Flex IO MKey. */
-	struct flexio_mkey *mkey;
+	struct ibv_mr *mr;
 
-	/* Set MKey protection domain (PD) to the Flex IO process PD. */
-	mkey_attr.pd = app_ctx->process_pd;
-	/* Set MKey address. */
-	mkey_attr.daddr = daddr;
-	/* Set MKey length. */
-	mkey_attr.len = Q_DATA_BSIZE;
-	/* Set MKey access to memory write (from DPA). */
-	mkey_attr.access = IBV_ACCESS_LOCAL_WRITE;
-	/* Create Flex IO MKey. */
-	if (flexio_device_mkey_create(app_ctx->flexio_process, &mkey_attr, &mkey)) {
-		printf("Failed to create Flex IO Mkey\n");
-		return NULL;
-	}
+	mr = ibv_reg_mr(pd, buf, len,
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+	if (!mr)
+		printf("Failed to register host MR\n");
 
-	return mkey;
+	return mr;
 }
 
 /* Base source MAC address; thread n matches SMAC = BASE_SMAC + n. */
@@ -334,21 +333,33 @@ static int cq_mem_alloc(struct flexio_process *process, struct app_transfer_cq *
 #define SQ_WQE_BSIZE L2V(LOG_SQ_WQE_BSIZE)
 /* SQ ring byte size is queue depth times WQE byte size. */
 #define SQ_RING_BSIZE (Q_DEPTH * SQ_WQE_BSIZE)
-/* Allocate DPA heap memory for SQ.
+/* Allocate host memory for SQ data buffer and DPA heap for SQ ring.
  * Returns 0 on success and -1 if the allocation fails.
- * process - pointer to the previously allocated process info.
- * sq_transf - structure with allocated DPA buffers for SQ.
+ * app_ctx - pointer to app_context structure.
  */
-static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *sq_transf)
+static int sq_mem_alloc(struct app_context *app_ctx, struct thread_ctx *t)
 {
-	/* Allocate DPA heap memory for SQ data. */
-	flexio_buf_dev_alloc(process, Q_DATA_BSIZE, &sq_transf->wqd_daddr);
-	if (!sq_transf->wqd_daddr)
+	/* Allocate 64-byte-aligned host memory for SQ packet data buffer. */
+	if (posix_memalign(&t->sq_data_hbuf, 64, Q_DATA_BSIZE)) {
+		printf("Failed to allocate host memory for SQ data\n");
+		return -1;
+	}
+	memset(t->sq_data_hbuf, 0, Q_DATA_BSIZE);
+
+	/* Register host buffer with NIC; mr->lkey used in WQEs and window config. */
+	t->sqd_mr = reg_host_mr(app_ctx->process_pd, t->sq_data_hbuf, Q_DATA_BSIZE);
+	if (!t->sqd_mr)
 		return -1;
 
-	/* Allocate DPA heap memory for SQ ring. */
-	flexio_buf_dev_alloc(process, SQ_RING_BSIZE, &sq_transf->wq_ring_daddr);
-	if (!sq_transf->wq_ring_daddr)
+	/* Store host VA in wqd_daddr (DPA treats this as the host VA base). */
+	t->sq_transf.wqd_daddr = (flexio_uintptr_t)t->sq_data_hbuf;
+	/* Store ibv lkey as mkey_id used in SQ WQEs and DPA window config. */
+	t->sq_transf.wqd_mkey_id = t->sqd_mr->lkey;
+
+	/* SQ ring stays on DPA heap for low-latency WQE access. */
+	flexio_buf_dev_alloc(app_ctx->flexio_process, SQ_RING_BSIZE,
+			     &t->sq_transf.wq_ring_daddr);
+	if (!t->sq_transf.wq_ring_daddr)
 		return -1;
 
 	return 0;
@@ -374,7 +385,7 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	/* SQ's CQ number. */
 	uint32_t cq_num;
 
-	/* Allocate CQ memory (ring and DBR) on DPA heap memory. */
+	/* Allocate CQ memory (ring and DBR) on DPA heap. */
 	if (cq_mem_alloc(app_fp, &t->sq_cq_transf)) {
 		printf("Failed to alloc memory for SQ's CQ.\n");
 		return -1;
@@ -410,8 +421,8 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	t->sq_cq_transf.cq_num = cq_num;
 	/* Set SQ's CQ depth in communication struct. */
 	t->sq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
-	/* Allocate SQ memory (ring and data) on DPA heap memory. */
-	if (sq_mem_alloc(app_fp, &t->sq_transf)) {
+	/* Allocate host memory for SQ data and DPA heap for SQ ring. */
+	if (sq_mem_alloc(app_ctx, t)) {
 		printf("Failed to allocate memory for SQ\n");
 		return -1;
 	}
@@ -422,9 +433,7 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	 * This will allow writing doorbells to the SQ from the DPA side.
 	 */
 	sq_attr.uar_id = uar_id;
-	/* Set SQ ring memory. Ring memory is on the DPA side in order to allow writing WQEs from
-	 * DPA during packet forwarding.
-	 */
+	/* Set SQ ring memory on DPA heap for low-latency WQE access from DPA. */
 	sq_attr.wq_ring_qmem.daddr = t->sq_transf.wq_ring_daddr;
 
 	/* Set SQ protection domain */
@@ -440,15 +449,7 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 
 	/* Fetch SQ's number to communicate to DPA side. */
 	t->sq_transf.wq_num = flexio_sq_get_wq_num(t->flexio_sq_ptr);
-
-	/* Create an MKey for SQ data buffer to send. */
-	t->sqd_mkey = create_dpa_mkey(app_ctx, t->sq_transf.wqd_daddr);
-	if (!t->sqd_mkey) {
-		printf("Failed to create an MKey for SQ data buffer\n");
-		return -1;
-	}
-	/* Set SQ's data buffer MKey ID in communication struct. */
-	t->sq_transf.wqd_mkey_id = flexio_mkey_get_id(t->sqd_mkey);
+	/* sq_transf.wqd_mkey_id already set to ibv lkey by sq_mem_alloc(). */
 
 	return 0;
 }
@@ -459,48 +460,61 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 #define RQ_WQE_BSIZE L2V(LOG_RQ_WQE_BSIZE)
 /* RQ ring byte size is queue depth times WQE byte size. */
 #define RQ_RING_BSIZE (Q_DEPTH * RQ_WQE_BSIZE)
-/* Allocate DPA heap memory for SQ.
+/* Allocate host memory for RQ data buffer and DPA heap for RQ ring and DBR.
  * Returns 0 on success and -1 if the allocation fails.
- * process - pointer to the previously allocated process info.
- * rq_transf - structure with allocated DPA buffers for RQ.
+ * app_ctx - pointer to app_context structure.
  */
-static int rq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *rq_transf)
+static int rq_mem_alloc(struct app_context *app_ctx, struct thread_ctx *t)
 {
-	/* DBR source memory on the host (to copy). */
+	/* DBR source memory on the host (to copy to DPA). */
 	__be32 dbr[2] = { 0, 0 };
 
-	/* Allocate DPA heap memory for RQ data. */
-	flexio_buf_dev_alloc(process, Q_DATA_BSIZE, &rq_transf->wqd_daddr);
-	if (!rq_transf->wqd_daddr)
+	/* Allocate 64-byte-aligned host memory for RQ packet data buffer. */
+	if (posix_memalign(&t->rq_data_hbuf, 64, Q_DATA_BSIZE)) {
+		printf("Failed to allocate host memory for RQ data\n");
+		return -1;
+	}
+	memset(t->rq_data_hbuf, 0, Q_DATA_BSIZE);
+
+	/* Register host buffer with NIC; mr->lkey used in WQEs and window config. */
+	t->rqd_mr = reg_host_mr(app_ctx->process_pd, t->rq_data_hbuf, Q_DATA_BSIZE);
+	if (!t->rqd_mr)
 		return -1;
 
-	/* Allocate DPA heap memory for RQ ring. */
-	flexio_buf_dev_alloc(process, RQ_RING_BSIZE, &rq_transf->wq_ring_daddr);
-	if (!rq_transf->wq_ring_daddr)
+	/* Store host VA in wqd_daddr (DPA treats this as the host VA base). */
+	t->rq_transf.wqd_daddr = (flexio_uintptr_t)t->rq_data_hbuf;
+	/* Store ibv lkey as mkey_id used in RQ WQEs and DPA window config. */
+	t->rq_transf.wqd_mkey_id = t->rqd_mr->lkey;
+
+	/* RQ ring stays on DPA heap. */
+	flexio_buf_dev_alloc(app_ctx->flexio_process, RQ_RING_BSIZE,
+			     &t->rq_transf.wq_ring_daddr);
+	if (!t->rq_transf.wq_ring_daddr)
 		return -1;
 
-	/* Allocate and initialize RQ DBR memory on the DPA heap memory. */
-	flexio_copy_from_host(process, dbr, sizeof(dbr), &rq_transf->wq_dbr_daddr);
-	if (!rq_transf->wq_dbr_daddr)
+	/* RQ DBR stays on DPA heap for direct DPA access. */
+	if (flexio_copy_from_host(app_ctx->flexio_process, dbr, sizeof(dbr),
+				  &t->rq_transf.wq_dbr_daddr)) {
+		printf("Failed to allocate RQ DBR on DPA heap\n");
 		return -1;
+	}
 
 	return 0;
 }
 
-/* Initialize an RQ ring memory over the DPA heap memory.
- * RQ WQEs need to be initialized (produced) by SW so they are ready for incoming packets.
- * The WQEs are initialized over temporary host memory and then copied to the DPA.
+/* Initialize an RQ ring on DPA heap memory.
+ * Each WQE data segment points to the corresponding slot in the host data buffer,
+ * using the ibv lkey from ibv_reg_mr so the NIC can DMA packets to host memory.
  * Returns 0 on success and -1 if the allocation fails.
- * process   - Flex IO process.
- * rq_transf - RQ transfer struct with DPA buffer addresses.
+ * app_ctx - app_ctx - pointer to app_context structure.
  */
-static int init_dpa_rq_ring(struct flexio_process *process, struct app_transfer_wq *rq_transf)
+static int init_dpa_rq_ring(struct app_context *app_ctx, struct thread_ctx *t)
 {
-	/* RQ WQE data iterator. */
-	flexio_uintptr_t wqe_data_daddr = rq_transf->wqd_daddr;
-	/* RQ ring MKey. */
-	uint32_t mkey_id = rq_transf->wqd_mkey_id;
-	/* Temporary host memory for RQ ring. */
+	/* Host virtual address of the first RQ data slot. */
+	uintptr_t wqe_data_haddr = (uintptr_t)t->rq_data_hbuf;
+	/* ibv lkey for the host RQ data buffer. */
+	uint32_t lkey = t->rqd_mr->lkey;
+	/* Temporary host memory for RQ ring initialization. */
 	struct mlx5_wqe_data_seg *rx_wqes;
 	/* RQ WQE iterator. */
 	struct mlx5_wqe_data_seg *dseg;
@@ -509,26 +523,25 @@ static int init_dpa_rq_ring(struct flexio_process *process, struct app_transfer_
 	/* RQ WQE index iterator. */
 	uint32_t i;
 
-	/* Allocate temporary host memory for RQ ring.*/
+	/* Allocate temporary host memory for RQ ring. */
 	rx_wqes = calloc(1, RQ_RING_BSIZE);
 	if (!rx_wqes) {
 		printf("Failed to allocate memory for rx_wqes\n");
 		return -1;
 	}
 
-	/* Initialize RQ WQEs'. */
+	/* Initialize RQ WQEs: each entry points to a slot in the host data buffer.
+	 * The NIC uses lkey to DMA-write received packets directly to host memory.
+	 */
 	for (i = 0, dseg = rx_wqes; i < Q_DEPTH; i++, dseg++) {
-		/* Set WQE's data segment to point to the relevant RQ data segment. */
-		mlx5dv_set_data_seg(dseg, Q_DATA_ENTRY_BSIZE, mkey_id, wqe_data_daddr);
-		/* Advance data pointer to next segment. */
-		wqe_data_daddr += Q_DATA_ENTRY_BSIZE;
+		mlx5dv_set_data_seg(dseg, Q_DATA_ENTRY_BSIZE, lkey, wqe_data_haddr);
+		wqe_data_haddr += Q_DATA_ENTRY_BSIZE;
 	}
 
-	/* Copy RX WQEs from host to RQ ring DPA heap memory. */
-	if (flexio_host2dev_memcpy(process, rx_wqes, RQ_RING_BSIZE, rq_transf->wq_ring_daddr))
+	/* Copy initialized RQ ring from host to DPA heap. */
+	if (flexio_host2dev_memcpy(app_ctx->flexio_process, rx_wqes, RQ_RING_BSIZE, t->rq_transf.wq_ring_daddr))
 		retval = -1;
 
-	/* Free temporary host memory. */
 	free(rx_wqes);
 	return retval;
 }
@@ -539,7 +552,7 @@ static int init_dpa_rq_ring(struct flexio_process *process, struct app_transfer_
  * process   - Flex IO process.
  * rq_transf - RQ transfer struct with DPA buffer addresses.
  */
-static int init_rq_dbr(struct flexio_process *process, struct app_transfer_wq *rq_transf)
+static int init_rq_dbr(struct app_context *app_ctx, struct thread_ctx *t)
 {
 	/* Temporary host memory for DBR value. */
 	__be32 dbr[2];
@@ -549,7 +562,7 @@ static int init_rq_dbr(struct flexio_process *process, struct app_transfer_wq *r
 	/* Send counter is not used for RQ so it is nullified. */
 	dbr[1] = htobe32(0);
 	/* Copy DBR value to DPA heap memory.*/
-	if (flexio_host2dev_memcpy(process, dbr, sizeof(dbr), rq_transf->wq_dbr_daddr))
+	if (flexio_host2dev_memcpy(app_ctx->flexio_process, dbr, sizeof(dbr), t->rq_transf.wq_dbr_daddr))
 		return -1;
 
 	return 0;
@@ -614,22 +627,14 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	t->rq_cq_transf.cq_num = cq_num;
 	/* Set RQ's CQ depth in communication struct. */
 	t->rq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
-	/* Allocate RQ memory (ring and data) on DPA heap memory. */
-	if (rq_mem_alloc(app_fp, &t->rq_transf)) {
+	/* Allocate host memory for RQ data and DPA heap for RQ ring and DBR. */
+	if (rq_mem_alloc(app_ctx, t)) {
 		printf("Failed to allocate memory for RQ.\n");
 		return -1;
 	}
-
-	/* Create an MKey for RX buffer */
-	t->rqd_mkey = create_dpa_mkey(app_ctx, t->rq_transf.wqd_daddr);
-	if (!t->rqd_mkey) {
-		printf("Failed to create an MKey for RQ data buffer.\n");
-		return -1;
-	}
-	/* Set RQ's data buffer MKey ID in communication struct. */
-	t->rq_transf.wqd_mkey_id = flexio_mkey_get_id(t->rqd_mkey);
-	/* Initialize RQ ring. */
-	if (init_dpa_rq_ring(app_fp, &t->rq_transf)) {
+	/* rq_transf.wqd_mkey_id already set to ibv lkey by rq_mem_alloc(). */
+	/* Initialize RQ ring with host-VA WQEs so NIC DMA-writes to host memory. */
+	if (init_dpa_rq_ring(app_ctx, t)) {
 		printf("Failed to init RQ ring.\n");
 		return -1;
 	}
@@ -722,6 +727,8 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	h2d_data->rq_cq_transf = t->rq_cq_transf;
 	/* Set RQ's information. */
 	h2d_data->rq_transf = t->rq_transf;
+	/* Set FlexIO window ID for DPA access to host memory buffers. */
+	h2d_data->window_id = flexio_window_get_id(t->window);
 	/* Set thread index so DPA selects the correct app_ctxs[] slot. */
 	h2d_data->thread_index = t->thread_index;
 	/* Set APP data info for first run. */
@@ -797,29 +804,27 @@ static int clean_up_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 		err = -1;
 	}
 
-	/* Clean up memory key for rqd if created */
-	if (t->rqd_mkey && flexio_device_mkey_destroy(t->rqd_mkey)) {
-		printf("Failed to destroy mkey RQD\n");
+	/* Deregister RQ host MR if created */
+	if (t->rqd_mr && ibv_dereg_mr(t->rqd_mr)) {
+		printf("Failed to deregister RQ host MR\n");
 		err = -1;
 	}
 
-	/* Clean up DBR daddr if created */
+	/* Free RQ host data buffer if allocated */
+	if (t->rq_data_hbuf)
+		free(t->rq_data_hbuf);
+
+	/* Clean up RQ DBR DPA memory if allocated */
 	if (t->rq_transf.wq_dbr_daddr &&
 	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wq_dbr_daddr)) {
 		printf("Failed to free rq_transf.wq_dbr_daddr\n");
 		err = -1;
 	}
 
-	/* Clean up wq_ring_daddr for rq_transf if created */
+	/* Clean up RQ ring DPA memory if allocated */
 	if (t->rq_transf.wq_ring_daddr &&
 	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wq_ring_daddr)) {
 		printf("Failed to free rq_transf.wq_ring_daddr\n");
-		err = -1;
-	}
-
-	if (t->rq_transf.wqd_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wqd_daddr)) {
-		printf("Failed to free rq_transf.wqd_daddr\n");
 		err = -1;
 	}
 
@@ -857,20 +862,20 @@ static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 		err = -1;
 	}
 
-	if (t->sqd_mkey && flexio_device_mkey_destroy(t->sqd_mkey)) {
-		printf("Failed to destroy mkey SQD\n");
+	/* Deregister SQ host MR if created */
+	if (t->sqd_mr && ibv_dereg_mr(t->sqd_mr)) {
+		printf("Failed to deregister SQ host MR\n");
 		err = -1;
 	}
 
+	/* Free SQ host data buffer if allocated */
+	if (t->sq_data_hbuf)
+		free(t->sq_data_hbuf);
+
+	/* Clean up SQ ring DPA memory if allocated */
 	if (t->sq_transf.wq_ring_daddr &&
 	    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wq_ring_daddr)) {
 		printf("Failed to free sq_transf.wq_ring_daddr\n");
-		err = -1;
-	}
-
-	if (t->sq_transf.wqd_daddr &&
-	    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wqd_daddr)) {
-		printf("Failed to free sq_transf.wqd_daddr\n");
 		err = -1;
 	}
 
@@ -1071,11 +1076,21 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+
 	/* Initialize all per-thread resources. */
 	for (i = 0; i < app_ctx.num_threads; i++) {
 		struct thread_ctx *t = &app_ctx.threads[i];
 
 		t->thread_index = (uint32_t)i;
+
+        /* Create a FlexIO window for DPA access to host memory packet buffers.
+        * The window ID is passed to the DPA so it can configure address translation.
+        */
+        if (flexio_window_create(app_fp, app_ctx.process_pd, &t->window)) {
+            printf("Failed to create FlexIO window\n");
+            err = -1;
+            goto cleanup;
+        }
 
 		/* Create an event handler pinned to EU i (FLEXIO_AFFINITY_STRICT). */
 		if (create_thread_event_handler(&app_ctx, t)) {
@@ -1084,14 +1099,14 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
-		/* Create an SQ for this thread. */
+		/* Create an SQ for this thread. */ 
 		if (create_thread_sq(&app_ctx, t)) {
 			printf("Failed to create SQ for thread %d.\n", i);
 			err = -1;
 			goto cleanup;
 		}
 
-		/* Create an RQ for this thread (RQ-CQ is linked to this thread's event handler). */
+		/* Create an RQ for this thread (RQ-CQ is linked to this thread's event handler). */ 
 		if (create_thread_rq(&app_ctx, t)) {
 			printf("Failed to create RQ for thread %d.\n", i);
 			err = -1;
@@ -1178,9 +1193,20 @@ cleanup:
 			}
 		}
 
+        /* Destroy FlexIO window if created */
+		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
+			struct thread_ctx *t = &app_ctx.threads[i];
+
+            if (t->window && flexio_window_destroy(t->window)) {
+                printf("Failed to destroy FlexIO window\n");
+                err = -1;
+            }
+		}
+
 		free(app_ctx.threads);
 		app_ctx.threads = NULL;
 	}
+
 
 	/* Destroy message stream if created */
 	if (app_fp && flexio_msg_stream_destroy(app_ctx.stream)) {
