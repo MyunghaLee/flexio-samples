@@ -199,7 +199,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	while (flexio_dev_cqe_get_owner(app_ctx.rq_cq_ctx.cqe) !=
 	       app_ctx.rq_cq_ctx.cq_hw_owner_bit) {
 		/* Print the message */
-		flexio_dev_print("Process packet: %ld\n", app_ctx.packets_count++);
+		// flexio_dev_print("Process packet: %ld\n", app_ctx.packets_count++);
 		/* Update memory to DPA */
 		__dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
 		/* Process the packet */
