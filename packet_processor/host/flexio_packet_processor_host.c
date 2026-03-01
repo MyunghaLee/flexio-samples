@@ -71,6 +71,7 @@ extern flexio_func_t flexio_pp_dev;
 struct thread_ctx {
 	uint32_t thread_index;
     uint8_t rxonly_enable;
+    uint8_t cqe_comp_enable;
 
 	/* Event handler */
 	struct flexio_event_handler *pp_eh;
@@ -608,8 +609,7 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	 */
 	rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
 
-    // rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_NONE;
-    // rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_ENABLE;
+    rqcq_attr.cqe_comp_type = t->cqe_comp_enable ? FLEXIO_CQE_COMP_ENABLE : FLEXIO_CQE_COMP_NONE;
 	/* Create CQ for RQ. */
 	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
@@ -1076,6 +1076,8 @@ int main(int argc, char **argv)
 	uint32_t num_threads = 1;
 	/* RX-only mode: DPA threads consume packets without sending them back. */
 	int rxonly_enable = 0;
+	/* CQE compression: enable hardware CQE compression on the RQ CQ. */
+	int cqe_comp_enable = 0;
 	/* Loop index */
 	int i;
 	/* Buffer for fread */
@@ -1087,7 +1089,7 @@ int main(int argc, char **argv)
 
 	/* Check input includes at least a device name. */
 	if (argc < 2) {
-		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off]\n",
+		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off]\n",
 		       argv[0]);
 		return -1;
 	}
@@ -1126,9 +1128,23 @@ int main(int argc, char **argv)
 				return -1;
 			}
 			i += 2;
+		} else if (!strcmp(argv[i], "--cqe_comp")) {
+			if (i + 1 >= argc) {
+				printf("--cqe_comp requires 'on' or 'off'\n");
+				return -1;
+			}
+			if (!strcmp(argv[i + 1], "on")) {
+				cqe_comp_enable = 1;
+			} else if (!strcmp(argv[i + 1], "off")) {
+				cqe_comp_enable = 0;
+			} else {
+				printf("--cqe_comp value must be 'on' or 'off'\n");
+				return -1;
+			}
+			i += 2;
 		} else {
 			printf("Unknown argument: %s\n", argv[i]);
-			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off]\n",
+			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off]\n",
 			       argv[0]);
 			return -1;
 		}
@@ -1247,6 +1263,7 @@ int main(int argc, char **argv)
 
 		t->thread_index = (uint32_t)i;
 		t->rxonly_enable = (uint8_t)rxonly_enable;
+		t->cqe_comp_enable = (uint8_t)cqe_comp_enable;
 
 		/* Create an event handler pinned to EU i (FLEXIO_AFFINITY_STRICT). */
 		if (create_thread_event_handler(&app_ctx, t)) {
