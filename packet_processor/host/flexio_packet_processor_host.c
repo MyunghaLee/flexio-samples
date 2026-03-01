@@ -220,6 +220,7 @@ static struct flexio_mkey *create_dpa_mkey(struct app_context *app_ctx, flexio_u
 
 /* Base source MAC address; thread n matches SMAC = BASE_SMAC + n. */
 #define BASE_SMAC 0x02427e7feb02ULL
+// #define BASE_SMAC 0xe8ebd3a72f16ULL
 #define THREAD_SMAC(i) (BASE_SMAC + (i))
 
 /* Creates steering rules for a single thread.
