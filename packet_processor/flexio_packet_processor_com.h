@@ -92,6 +92,8 @@ struct host2dev_packet_processor_data {
     uint16_t  heartbeat;
 	uint8_t  not_first_run;
 	uint8_t  rxonly_enabled;
+	uint32_t window_id;      /* FlexIO window ID for DPA→host memory access */
+	uint8_t  hostbuf_enabled; /* 1 = packet data buffers in host memory */
 } __attribute__((__packed__, aligned(8)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */

@@ -60,7 +60,7 @@ struct app_device_ctx {
 	/* Packet count - used for debug message */
 	uint64_t  packets_count;
 	uint64_t  comp_packets_count;
-	/* lkey - local memory key */
+	/* lkey - local memory key (DPA flexio mkey or ibv lkey depending on mode) */
 	uint32_t  lkey;
 	/* Thread index - mirrors host-side assignment */
 	uint32_t  thread_index;
@@ -70,6 +70,17 @@ struct app_device_ctx {
 	sq_ctx_t  sq_ctx;       /* SQ */
 	cq_ctx_t  sq_cq_ctx;    /* SQ CQ */
 	dt_ctx_t  dt_ctx;       /* SQ Data ring */
+
+	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
+	uint8_t  hostbuf_enabled;
+	uint32_t window_id;          /* FlexIO window ID */
+	uint32_t rqd_mkey;           /* ibv lkey for RQ data buffer */
+	uint32_t sqd_mkey;           /* ibv lkey for SQ data buffer */
+	uint64_t rqd_haddr_base;     /* host VA base of RQ data buffer */
+	uint64_t sqd_haddr_base;     /* host VA base of SQ data buffer */
+	/* Per-invocation DPA window pointers (set at start of each handler call) */
+	flexio_uintptr_t rqd_dpa_base;
+	flexio_uintptr_t sqd_dpa_base;
 };
 
 /* Static array of per-thread contexts. Each event handler is pinned to a dedicated EU,
@@ -106,6 +117,16 @@ static void app_ctx_init(struct app_device_ctx *ctx,
     ctx->comp_packets_count = 0;
 	ctx->lkey = data_from_host->sq_transf.wqd_mkey_id;
 	ctx->thread_index = data_from_host->thread_index;
+
+	/* Initialize host buffer mode fields. */
+	ctx->hostbuf_enabled = data_from_host->hostbuf_enabled;
+	if (data_from_host->hostbuf_enabled) {
+		ctx->window_id = data_from_host->window_id;
+		ctx->rqd_mkey = data_from_host->rq_transf.wqd_mkey_id;
+		ctx->sqd_mkey = data_from_host->sq_transf.wqd_mkey_id;
+		ctx->rqd_haddr_base = data_from_host->rq_transf.wqd_daddr;
+		ctx->sqd_haddr_base = data_from_host->sq_transf.wqd_daddr;
+	}
 
 	/* Set context for RQ's CQ */
 	com_cq_ctx_init(&ctx->rq_cq_ctx,
@@ -188,13 +209,15 @@ static void process_packet(struct app_device_ctx *ctx)
 	struct flexio_dev_wqe_rcv_data_seg *rwqe;
 	/* RQ WQE index */
 	uint32_t rq_wqe_idx;
-	/* Pointer to RQ data */
+	/* Pointer to RQ data (DPA address — either DPA heap or window-mapped host memory) */
 	char *rq_data;
 
 	/* TX packet handling variables */
 	union flexio_dev_sqe_seg *swqe;
-	/* Pointer to SQ data */
+	/* Pointer to SQ data (DPA address — either DPA heap or window-mapped host memory) */
 	char *sq_data;
+	/* Host VA of the SQ slot — used in WQE when hostbuf_enabled (NIC reads via IOMMU) */
+	uint64_t sq_haddr;
 
 	/* Size of the data */
 	uint32_t data_sz;
@@ -206,11 +229,22 @@ static void process_packet(struct app_device_ctx *ctx)
 	/* Get the RQ WQE pointed to by the CQE */
 	rwqe = &ctx->rq_ctx.rq_ring[rq_wqe_idx & RQ_IDX_MASK];
 
-	/* Extract data (whole packet) pointed to by the RQ WQE */
-	rq_data = flexio_dev_rwqe_get_addr(rwqe);
+	if (ctx->hostbuf_enabled) {
+		/* Host buffer mode: WQE contains host VA; translate to DPA window pointer. */
+		uint64_t rq_haddr = (uint64_t)flexio_dev_rwqe_get_addr(rwqe);
+		rq_data = (char *)(ctx->rqd_dpa_base + (rq_haddr - ctx->rqd_haddr_base));
 
-	/* Take the next entry from the data ring */
-	sq_data = get_next_dte(&ctx->dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+		/* Compute host VA and DPA window pointer for the next SQ data slot. */
+		uint32_t sq_slot = ctx->dt_ctx.tx_buff_idx & DATA_IDX_MASK;
+		sq_haddr = ctx->sqd_haddr_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE);
+		sq_data = (char *)(ctx->sqd_dpa_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE));
+		ctx->dt_ctx.tx_buff_idx++;
+	} else {
+		/* DPA buffer mode: pointers are DPA heap addresses, usable directly. */
+		rq_data = flexio_dev_rwqe_get_addr(rwqe);
+		sq_data = get_next_dte(&ctx->dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+		sq_haddr = 0; /* unused in DPA mode */
+	}
 
 	/* Copy received packet to sq_data as is */
 	memcpy(sq_data, rq_data, data_sz);
@@ -239,9 +273,17 @@ static void process_packet(struct app_device_ctx *ctx)
 	swqe = get_next_sqe(&ctx->sq_ctx, SQ_IDX_MASK);
 	flexio_dev_swqe_seg_eth_set(swqe, 0, 0, 0, NULL);
 
-	/* Fill out 3-rd segment (Data) */
+	/* Fill out 3-rd segment (Data).
+	 * hostbuf: WQE addr = host VA (NIC uses lkey for IOMMU); must flush window first.
+	 * DPA buf: WQE addr = DPA heap pointer (NIC uses flexio mkey). */
 	swqe = get_next_sqe(&ctx->sq_ctx, SQ_IDX_MASK);
-	flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, ctx->lkey, (uint64_t)sq_data);
+	if (ctx->hostbuf_enabled) {
+		/* Flush window writes so NIC sees the packet data in host memory. */
+		__dpa_thread_window_writeback();
+		flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, ctx->lkey, sq_haddr);
+	} else {
+		flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, ctx->lkey, (uint64_t)sq_data);
+	}
 
 	/* Send WQE is 4 WQEBBs need to skip the 4-th segment */
 	swqe = get_next_sqe(&ctx->sq_ctx, SQ_IDX_MASK);
@@ -283,6 +325,17 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	if (!data_from_host->not_first_run) {
 		app_ctx_init(ctx, data_from_host);
 		data_from_host->not_first_run = 1;
+	}
+
+	/* Configure window entities every invocation (window state resets between invocations).
+	 * Entity 0 → RQ data buffer, Entity 1 → SQ data buffer.
+	 * Also acquire DPA-accessible base pointers into the host buffers.
+	 */
+	if (ctx->hostbuf_enabled) {
+		flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_0, ctx->window_id, ctx->rqd_mkey);
+		flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_1, ctx->window_id, ctx->sqd_mkey);
+		flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0, ctx->rqd_haddr_base, &ctx->rqd_dpa_base);
+		flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_1, ctx->sqd_haddr_base, &ctx->sqd_dpa_base);
 	}
 
     uint64_t last_packet_count = ctx->packets_count;
