@@ -59,6 +59,7 @@
 struct app_device_ctx {
 	/* Packet count - used for debug message */
 	uint64_t  packets_count;
+	uint64_t  comp_packets_count;
 	/* lkey - local memory key */
 	uint32_t  lkey;
 	/* Thread index - mirrors host-side assignment */
@@ -84,6 +85,7 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 			  struct host2dev_packet_processor_data *data_from_host)
 {
 	ctx->packets_count = 0;
+    ctx->comp_packets_count = 0;
 	ctx->lkey = data_from_host->sq_transf.wqd_mkey_id;
 	ctx->thread_index = data_from_host->thread_index;
 
@@ -199,6 +201,7 @@ static void process_packet(struct app_device_ctx *ctx)
 
 static void update_data_from_host(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
     data_from_host->report_packets_count = ctx->packets_count;
+    data_from_host->report_comp_packets_count = ctx->comp_packets_count;
     data_from_host->heartbeat++;
     __dpa_thread_memory_writeback();
 }

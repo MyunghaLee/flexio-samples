@@ -607,6 +607,9 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	 * DPA during packet forwarding.
 	 */
 	rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
+
+    // rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_NONE;
+    // rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_ENABLE;
 	/* Create CQ for RQ. */
 	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
@@ -969,7 +972,7 @@ static int system_prompt(struct app_context *app_ctx)
 		return -1;
 	}
 
-	printf("Commands: 1=alive threads  2=Mpps  0=quit\n");
+	printf("Commands: 1=alive threads  2=Mpps  3=compress percentage%%  0=quit\n");
 
 	while (!g_quit_prompt) {
 		printf("> ");
@@ -1015,6 +1018,25 @@ static int system_prompt(struct app_context *app_ctx)
 					     snap_before[i].report_packets_count;
 			}
 			printf("Throughput: %.3f Mpps\n", (double)total_pps / 1e6);
+		} else if (cmd == 3) {
+			/* Measure comp_packets / packets over 1 second. display as percentage */
+			uint64_t total_pkts = 0, total_comp = 0;
+
+			for (i = 0; i < n; i++)
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
+			sleep(1);
+			for (i = 0; i < n; i++) {
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_after[i]);
+				total_pkts += snap_after[i].report_packets_count -
+					      snap_before[i].report_packets_count;
+				total_comp += snap_after[i].report_comp_packets_count -
+					      snap_before[i].report_comp_packets_count;
+			}
+			if (total_pkts > 0)
+				printf("Compress percentage: %.2f%%\n",
+				       (double)total_comp / (double)total_pkts * 100.0);
+			else
+				printf("Compress percentage: N/A (no packets received)\n");
 		}
 		/* else: ignore unrecognized input */
 	}
