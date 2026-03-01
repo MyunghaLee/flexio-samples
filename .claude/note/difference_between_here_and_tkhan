@@ -1,0 +1,79 @@
+# Code Flow Differences: Our hostbuf vs tkhan Reference
+
+## Summary
+
+After exhaustive line-by-line comparison, the core packet processing logic
+(WQE setup, data pointer handling, fence ordering, doorbell ringing, CQ stepping)
+is **functionally identical** for the host-memory data path.
+
+## Structural Differences (non-functional)
+
+### 1. Single context vs per-thread array
+- **Ours**: `static struct { ... } app_ctx;` — single global context
+- **tkhan**: `static struct app_thread_ctx app_ctxs[MAX_APP_THREADS];`
+  indexed via `data_from_host->thread_index`
+- **Impact**: None — both use a single thread in practice
+
+### 2. CQE compression support
+- **Ours**: Not implemented — uses standard CQE ownership check
+- **tkhan**: Has `decompress_current_cqe_if_needed()` and `rq_cqe_ready()`
+  for compressed CQE handling. Host also sets `cqe_comp_type = 0x2` on RQ CQ.
+- **Impact**: None for forwarding — our host doesn't enable compression,
+  so NIC sends uncompressed CQEs. CQE compression is a separate feature.
+
+### 3. rx_only mode
+- **Ours**: Not implemented
+- **tkhan**: Has `rx_only_enable` flag that skips TX path and only counts packets
+- **Impact**: None — we always forward
+
+### 4. Debug control
+- **Ours**: No debug toggle (we added `DEBUG_ENABLE` compile-time flag)
+- **tkhan**: Has `debug_enable` field in h2d struct, conditional prints
+- **Impact**: None
+
+### 5. Extra h2d fields
+- **tkhan** has: `rx_packets`, `rx_only_enable`, `debug_enable`, `thread_index`
+  between `window_id` and `not_first_run`
+- **Ours**: Just `window_id` then `not_first_run`
+- **Impact**: None — both sides use the same header, struct layout is self-consistent
+
+### 6. Message stream log level
+- **Ours**: Always `FLEXIO_MSG_DEV_INFO`
+- **tkhan**: `debug_enable ? INFO : WARN`
+- **Impact**: None for forwarding
+
+## Identical Critical Code Paths
+
+All of these are functionally identical between the two codebases:
+
+- `map_host_buffers()` — window config + ptr_acquire logic
+- `process_packet()` — CQE extract, RQ WQE read, host-to-dpa translation,
+  memcpy, swap_macs, SQ WQE build, data segment setup
+- Fence/writeback sequence: window_writeback → memory fence → doorbell → fence → RQ DBR
+- SQ WQE data segment: uses host VA + ibv lkey
+- CQ polling loop structure
+- CQ arm + reschedule at end
+- Host-side: ibv_reg_mr for data buffers, flexio_window_create, RQ WQE init
+  with host VA + lkey, copy_app_data_to_dpa
+- `(uint16_t)` cast on window_id in `flexio_dev_window_config` — same in both
+
+## Host-side Differences
+
+### tkhan has dual-mode (DPA vs host memory)
+- tkhan supports `--args mem=host` to switch between DPA and host data buffers
+- Our code always uses host memory (hard-coded `daddr_on_host = 1`)
+- The host-memory code path is identical
+
+### MKey creation
+- **DPA mode (tkhan only)**: `flexio_buf_dev_alloc` + `flexio_device_mkey_create`
+- **Host mode (both)**: `posix_memalign` + `ibv_reg_mr`
+- Same MR access flags: `LOCAL_WRITE | REMOTE_WRITE | REMOTE_READ | REMOTE_ATOMIC`
+
+## Conclusion
+
+No code-level difference explains the forwarding failure. The issue is likely:
+1. Environmental (device config, link state, MAC mismatch)
+2. Runtime (window mapping failure, SQ send errors)
+3. The tkhan reference might also not work on this specific system
+
+Debug prints have been added to diagnose at runtime.
