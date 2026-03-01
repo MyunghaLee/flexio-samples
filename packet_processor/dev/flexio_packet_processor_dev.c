@@ -46,6 +46,9 @@
 /* Shared header file for packet processor sample */
 #include "../flexio_packet_processor_com.h"
 
+/* Enable debug prints (set to 0 to disable) */
+#define DEBUG_ENABLE 1
+
 /* Mask for CQ index */
 #define CQ_IDX_MASK ((1 << LOG_CQ_DEPTH) - 1)
 /* Mask for RQ index */
@@ -106,26 +109,38 @@ static int map_host_buffers(void)
 	if (app_ctx.rq_on_host) {
 		ret = flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_0,
 					       (uint16_t)app_ctx.window_id, app_ctx.rq_lkey);
-		if (ret != FLEXIO_DEV_STATUS_SUCCESS)
+		if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
+			if (DEBUG_ENABLE)
+				flexio_dev_print("ERR: rq window_config failed ret=%d\n", (int)ret);
 			return -1;
+		}
 		ret = flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0,
 						    (uint64_t)app_ctx.rq_host_base,
 						    &app_ctx.rq_dpa_base);
-		if (ret != FLEXIO_DEV_STATUS_SUCCESS)
+		if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
+			if (DEBUG_ENABLE)
+				flexio_dev_print("ERR: rq ptr_acquire failed ret=%d\n", (int)ret);
 			return -1;
+		}
 		sq_entity = FLEXIO_DEV_WINDOW_ENTITY_1;
 	}
 
 	if (app_ctx.sq_on_host) {
 		ret = flexio_dev_window_config(sq_entity,
 					       (uint16_t)app_ctx.window_id, app_ctx.lkey);
-		if (ret != FLEXIO_DEV_STATUS_SUCCESS)
+		if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
+			if (DEBUG_ENABLE)
+				flexio_dev_print("ERR: sq window_config failed ret=%d\n", (int)ret);
 			return -1;
+		}
 		ret = flexio_dev_window_ptr_acquire(sq_entity,
 						    (uint64_t)app_ctx.sq_host_base,
 						    &app_ctx.sq_dpa_base);
-		if (ret != FLEXIO_DEV_STATUS_SUCCESS)
+		if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
+			if (DEBUG_ENABLE)
+				flexio_dev_print("ERR: sq ptr_acquire failed ret=%d\n", (int)ret);
 			return -1;
+		}
 	}
 
 	return 0;
@@ -290,6 +305,18 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	if (!data_from_host->not_first_run) {
 		app_ctx_init(data_from_host);
 		data_from_host->not_first_run = 1;
+		if (DEBUG_ENABLE) {
+			flexio_dev_print("INIT: rq_on_host=%u sq_on_host=%u win_id=%u\n",
+					 (unsigned)app_ctx.rq_on_host,
+					 (unsigned)app_ctx.sq_on_host,
+					 (unsigned)app_ctx.window_id);
+			flexio_dev_print("INIT: rq_lkey=0x%x sq_lkey=0x%x\n",
+					 (unsigned)app_ctx.rq_lkey,
+					 (unsigned)app_ctx.lkey);
+			flexio_dev_print("INIT: rq_host_base=0x%lx sq_host_base=0x%lx\n",
+					 (unsigned long)app_ctx.rq_host_base,
+					 (unsigned long)app_ctx.sq_host_base);
+		}
 	}
 
 	/* Configure FlexIO window entities for host memory access.
@@ -299,9 +326,15 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	 */
 	if (app_ctx.rq_on_host || app_ctx.sq_on_host) {
 		if (map_host_buffers()) {
+			if (DEBUG_ENABLE)
+				flexio_dev_print("ERR: map_host_buffers failed\n");
 			flexio_dev_thread_reschedule();
 			return;
 		}
+		if (DEBUG_ENABLE && app_ctx.packets_count == 0)
+			flexio_dev_print("MAP: rq_dpa=0x%lx sq_dpa=0x%lx\n",
+					 (unsigned long)app_ctx.rq_dpa_base,
+					 (unsigned long)app_ctx.sq_dpa_base);
 	}
 
 	/* Poll CQ until all pending packets are processed. */
@@ -312,6 +345,10 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		/* Process the packet. */
 		process_packet();
 		app_ctx.packets_count++;
+		if (DEBUG_ENABLE && (app_ctx.packets_count <= 3 ||
+				     (app_ctx.packets_count & 0xfff) == 0))
+			flexio_dev_print("PKT: count=%lu\n",
+					 (unsigned long)app_ctx.packets_count);
 		/* Update RQ CQ */
 		com_step_cq(&app_ctx.rq_cq_ctx);
 	}

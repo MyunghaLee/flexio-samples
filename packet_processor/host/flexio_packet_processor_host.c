@@ -1082,6 +1082,17 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	printf("Host params:\n");
+	printf("  RQ data hbuf=%p lkey=0x%x on_host=%u\n",
+	       app_ctx.rq_data_hbuf, app_ctx.rqd_mr->lkey,
+	       app_ctx.rq_transf.daddr_on_host);
+	printf("  SQ data hbuf=%p lkey=0x%x on_host=%u\n",
+	       app_ctx.sq_data_hbuf, app_ctx.sqd_mr->lkey,
+	       app_ctx.sq_transf.daddr_on_host);
+	printf("  window_id=%u\n", flexio_window_get_id(app_ctx.window));
+	printf("  rq wqd_daddr=0x%lx sq wqd_daddr=0x%lx\n",
+	       (unsigned long)app_ctx.rq_transf.wqd_daddr,
+	       (unsigned long)app_ctx.sq_transf.wqd_daddr);
 	printf("Ready to receive messages\n");
 
 	/* Start event handler - move from the init state to the running state.

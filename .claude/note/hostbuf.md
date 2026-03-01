@@ -386,3 +386,37 @@ SQ packet data from host memory.
 - DPA bases initialized to host bases in `app_ctx_init()` — overwritten by
   `map_host_buffers()` when on host. This lets the same code path work for DPA-memory
   mode too (no window mapping needed, addresses used directly).
+
+---
+
+## 11. Thorough Comparison with tkhan (forwarding still not working)
+
+A line-by-line comparison of all code paths with the tkhan reference found
+**no functional differences** in the host-memory data path. See
+`.claude/note/difference_between_here_and_tkhan` for full details.
+
+### Debug output added
+
+Since no code-level bug was found, debug prints were added to diagnose at runtime:
+
+**Device side (`flexio_packet_processor_dev.c`):**
+- `DEBUG_ENABLE` compile-time flag (set to 1)
+- INIT prints: rq_on_host, sq_on_host, window_id, lkeys, buffer base addresses
+- MAP prints: acquired DPA base addresses after window mapping
+- ERR prints: specific error on window_config / ptr_acquire failure
+- PKT prints: packet count (first 3 packets + every 4096th)
+
+**Host side (`flexio_packet_processor_host.c`):**
+- Prints all key parameters before event handler starts:
+  data buffer addresses, lkeys, daddr_on_host flags, window_id, wqd_daddr values
+
+### Next steps for diagnosis
+
+Run the app and check output:
+1. If no INIT print → event handler never triggered (CQ/steering issue)
+2. If INIT prints but ERR on window → window/mkey configuration issue
+3. If MAP prints but no PKT → no CQEs arriving (traffic/MAC/steering issue)
+4. If PKT prints but no forwarded packets → SQ send errors (check SQ CQ)
+
+To check SQ send errors, temporarily change `FLEXIO_CTRL_SEG_CE_CQE_ON_CQE_ERROR`
+to `FLEXIO_CTRL_SEG_CE_CQE_ALWAYS` and add SQ CQ polling after sending.
