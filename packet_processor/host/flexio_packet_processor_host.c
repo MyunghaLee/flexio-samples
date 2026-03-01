@@ -75,10 +75,12 @@ struct thread_ctx {
     uint8_t hostbuf_enable;
 
 	/* Host buffer resources (used only when hostbuf_enable == 1) */
-	void         *rq_data_hbuf;
-	void         *sq_data_hbuf;
-	struct ibv_mr *rqd_mr;
-	struct ibv_mr *sqd_mr;
+	/* Combined buffer: RQ data occupies the first half, SQ data the second half.
+	 * A single ibv_reg_mr covers the whole region so both halves share one lkey,
+	 * allowing the DPA to access both via a single FlexIO window entity (ENTITY_0).
+	 */
+	void          *data_hbuf; /* combined host buffer (2 * Q_DATA_BSIZE) */
+	struct ibv_mr *data_mr;   /* single MR covering the combined buffer */
 
 	/* Event handler */
 	struct flexio_event_handler *pp_eh;
@@ -369,8 +371,10 @@ static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 	return 0;
 }
 
-/* Allocate host memory and register MR for SQ data buffer (hostbuf mode).
- * wqd_daddr is set to the host virtual address; wqd_mkey_id to the ibv lkey.
+/* Allocate host memory and register a single MR for both RQ and SQ data buffers (hostbuf mode).
+ * The combined buffer layout: [RQ data | SQ data], each Q_DATA_BSIZE bytes.
+ * One ibv lkey covers both halves, so only FLEXIO_DEV_WINDOW_ENTITY_0 is needed on the DPA.
+ * sq_transf->wqd_daddr/wqd_mkey_id are set here; rq_transf fields are set by rq_mem_alloc_hostbuf.
  * Returns 0 on success and -1 on failure.
  * app_ctx  - pointer to app_context structure.
  * t        - pointer to thread_ctx for this thread.
@@ -379,25 +383,29 @@ static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 static int sq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *t,
 				struct app_transfer_wq *sq_transf)
 {
-	/* Allocate 64-byte-aligned host memory for SQ data (NIC reads from here). */
-	if (posix_memalign(&t->sq_data_hbuf, 64, Q_DATA_BSIZE)) {
-		printf("Failed to allocate host memory for SQ data buffer\n");
+	/* Allocate one combined 64-byte-aligned buffer: first half = RQ, second half = SQ. */
+	if (posix_memalign(&t->data_hbuf, 64, 2 * Q_DATA_BSIZE)) {
+		printf("Failed to allocate host memory for combined RQ+SQ data buffer\n");
 		return -1;
 	}
 
-	/* Register MR: NIC reads from this buffer when sending packets. */
-	t->sqd_mr = ibv_reg_mr(app_ctx->process_pd, t->sq_data_hbuf, Q_DATA_BSIZE,
-			       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
-	if (!t->sqd_mr) {
-		printf("Failed to register MR for SQ data host buffer\n");
-		free(t->sq_data_hbuf);
-		t->sq_data_hbuf = NULL;
+	/* Register a single MR covering the combined buffer.
+	 * NIC needs REMOTE_WRITE to DMA packets into the RQ half and REMOTE_READ to
+	 * fetch packet data from the SQ half. LOCAL_WRITE is required by the verbs API.
+	 */
+	t->data_mr = ibv_reg_mr(app_ctx->process_pd, t->data_hbuf, 2 * Q_DATA_BSIZE,
+			       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+			       IBV_ACCESS_REMOTE_READ);
+	if (!t->data_mr) {
+		printf("Failed to register MR for combined data host buffer\n");
+		free(t->data_hbuf);
+		t->data_hbuf = NULL;
 		return -1;
 	}
 
-	/* Store host VA and ibv lkey in transfer struct. */
-	sq_transf->wqd_daddr = (flexio_uintptr_t)(uintptr_t)t->sq_data_hbuf;
-	sq_transf->wqd_mkey_id = t->sqd_mr->lkey;
+	/* SQ occupies the second half of the combined buffer. */
+	sq_transf->wqd_daddr = (flexio_uintptr_t)((uintptr_t)t->data_hbuf + Q_DATA_BSIZE);
+	sq_transf->wqd_mkey_id = t->data_mr->lkey;
 
 	/* Allocate DPA heap memory for SQ ring (descriptor ring stays on DPA). */
 	flexio_buf_dev_alloc(app_ctx->flexio_process, SQ_RING_BSIZE, &sq_transf->wq_ring_daddr);
@@ -542,8 +550,10 @@ static int rq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 	return 0;
 }
 
-/* Allocate host memory and register MR for RQ data buffer (hostbuf mode).
- * wqd_daddr is set to the host virtual address; wqd_mkey_id to the ibv lkey.
+/* Set up RQ data transfer info for hostbuf mode using the combined buffer.
+ * The combined buffer (data_hbuf / data_mr) was already allocated by sq_mem_alloc_hostbuf.
+ * RQ occupies the first half; this function sets wqd_daddr/wqd_mkey_id accordingly and
+ * allocates the RQ descriptor ring and DBR on DPA heap.
  * Returns 0 on success and -1 on failure.
  * app_ctx  - pointer to app_context structure.
  * t        - pointer to thread_ctx for this thread.
@@ -555,25 +565,11 @@ static int rq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *
 	/* DBR source memory on the host (to copy). */
 	__be32 dbr[2] = { 0, 0 };
 
-	/* Allocate 64-byte-aligned host memory for RQ data (NIC DMA target). */
-	if (posix_memalign(&t->rq_data_hbuf, 64, Q_DATA_BSIZE)) {
-		printf("Failed to allocate host memory for RQ data buffer\n");
-		return -1;
-	}
-
-	/* Register MR: NIC will DMA incoming packets into this buffer. */
-	t->rqd_mr = ibv_reg_mr(app_ctx->process_pd, t->rq_data_hbuf, Q_DATA_BSIZE,
-			       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-	if (!t->rqd_mr) {
-		printf("Failed to register MR for RQ data host buffer\n");
-		free(t->rq_data_hbuf);
-		t->rq_data_hbuf = NULL;
-		return -1;
-	}
-
-	/* Store host VA and ibv lkey in transfer struct (reusing DPA address fields). */
-	rq_transf->wqd_daddr = (flexio_uintptr_t)(uintptr_t)t->rq_data_hbuf;
-	rq_transf->wqd_mkey_id = t->rqd_mr->lkey;
+	/* RQ occupies the first half of the combined buffer (allocated in sq_mem_alloc_hostbuf).
+	 * Both halves share the same ibv lkey from the single MR.
+	 */
+	rq_transf->wqd_daddr = (flexio_uintptr_t)(uintptr_t)t->data_hbuf;
+	rq_transf->wqd_mkey_id = t->data_mr->lkey;
 
 	/* Allocate DPA heap memory for RQ ring (descriptor ring stays on DPA). */
 	flexio_buf_dev_alloc(app_ctx->flexio_process, RQ_RING_BSIZE, &rq_transf->wq_ring_daddr);
@@ -949,21 +945,14 @@ static int clean_up_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 		err = -1;
 	}
 
-	if (t->hostbuf_enable) {
-		/* Host buffer mode: deregister MR and free host memory. */
-		if (t->rqd_mr && ibv_dereg_mr(t->rqd_mr)) {
-			printf("Failed to deregister RQ data MR\n");
-			err = -1;
-		}
-		free(t->rq_data_hbuf);
-		t->rq_data_hbuf = NULL;
-	} else {
+	if (!t->hostbuf_enable) {
 		if (t->rq_transf.wqd_daddr &&
 		    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wqd_daddr)) {
 			printf("Failed to free rq_transf.wqd_daddr\n");
 			err = -1;
 		}
 	}
+	/* In hostbuf mode the combined buffer and its MR are freed in clean_up_thread_sq. */
 
 	if (t->flexio_rq_cq_ptr && flexio_cq_destroy(t->flexio_rq_cq_ptr)) {
 		printf("Failed to destroy RQ CQ\n");
@@ -1012,13 +1001,15 @@ static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	}
 
 	if (t->hostbuf_enable) {
-		/* Host buffer mode: deregister MR and free host memory. */
-		if (t->sqd_mr && ibv_dereg_mr(t->sqd_mr)) {
-			printf("Failed to deregister SQ data MR\n");
+		/* Host buffer mode: deregister the single combined MR and free the buffer.
+		 * Both RQ and SQ halves are covered by data_mr / data_hbuf.
+		 */
+		if (t->data_mr && ibv_dereg_mr(t->data_mr)) {
+			printf("Failed to deregister combined data MR\n");
 			err = -1;
 		}
-		free(t->sq_data_hbuf);
-		t->sq_data_hbuf = NULL;
+		free(t->data_hbuf);
+		t->data_hbuf = NULL;
 	} else {
 		if (t->sq_transf.wqd_daddr &&
 		    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wqd_daddr)) {

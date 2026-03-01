@@ -327,15 +327,19 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		data_from_host->not_first_run = 1;
 	}
 
-	/* Configure window entities every invocation (window state resets between invocations).
-	 * Entity 0 → RQ data buffer, Entity 1 → SQ data buffer.
-	 * Also acquire DPA-accessible base pointers into the host buffers.
+	/* Configure the window every invocation (window state resets between invocations).
+	 * RQ and SQ data share a single combined host buffer registered under one lkey,
+	 * so only FLEXIO_DEV_WINDOW_ENTITY_0 is needed.
+	 * Acquire a DPA window pointer for the combined buffer base (= RQ half start),
+	 * then derive the SQ base pointer as an offset within the same window.
 	 */
 	if (ctx->hostbuf_enabled) {
+		flexio_uintptr_t combined_dpa_base;
+
 		flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_0, ctx->window_id, ctx->rqd_mkey);
-		flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_1, ctx->window_id, ctx->sqd_mkey);
-		flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0, ctx->rqd_haddr_base, &ctx->rqd_dpa_base);
-		flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_1, ctx->sqd_haddr_base, &ctx->sqd_dpa_base);
+		flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0, ctx->rqd_haddr_base, &combined_dpa_base);
+		ctx->rqd_dpa_base = combined_dpa_base;
+		ctx->sqd_dpa_base = combined_dpa_base + (ctx->sqd_haddr_base - ctx->rqd_haddr_base);
 	}
 
     uint64_t last_packet_count = ctx->packets_count;
