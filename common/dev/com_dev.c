@@ -147,6 +147,19 @@ void com_step_cq(cq_ctx_t *cq_ctx)
 	flexio_dev_dbr_cq_set_ci(cq_ctx->cq_dbr, cq_ctx->cq_idx);
 }
 
+void com_step_cq_with_one_padding(cq_ctx_t *cq_ctx)
+{
+	uint32_t cq_idx_mask = L2M(cq_ctx->log_cq_depth);
+
+	cq_ctx->cq_idx++;
+	cq_ctx->cqe = &cq_ctx->cq_ring[cq_ctx->cq_idx & cq_idx_mask];
+	/* check for wrap around */
+	if (!(cq_ctx->cq_idx & cq_idx_mask))
+		cq_ctx->cq_hw_owner_bit = !cq_ctx->cq_hw_owner_bit;
+
+	flexio_dev_dbr_cq_set_ci(cq_ctx->cq_dbr, cq_ctx->cq_idx - 1U);
+}
+
 /* Update the eq_ctx_t structure and EQ with no DBR.
  *  eq_ctx - pointer to the eq_ctx_t structure.
  *  eq_idx_mask - mask of indexes.

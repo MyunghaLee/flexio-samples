@@ -74,6 +74,7 @@ typedef struct {
 	uint32_t rq_number;
 	struct flexio_dev_wqe_rcv_data_seg *rq_ring;
 	uint32_t *rq_dbr;
+    uint8_t first_doorbelled;
 } rq_ctx_t;
 
 /* Sample DPA SQ metadata structure.
@@ -147,6 +148,8 @@ void com_dt_ctx_init(dt_ctx_t *dt_ctx, flexio_uintptr_t buff_addr);
  *  cq_ctx - pointer to cq_ctx_t structure to update
  */
 void com_step_cq(cq_ctx_t *cq_ctx);
+
+void com_step_cq_with_one_padding(cq_ctx_t *cq_ctx);
 
 /* Get the pointer to the next data entry.
  *  dt_ctx - the pointer to the dt_ctx_t structure.

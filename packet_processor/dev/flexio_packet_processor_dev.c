@@ -77,6 +77,24 @@ struct app_device_ctx {
  */
 static struct app_device_ctx app_ctxs[APP_MAX_DPA_THREADS];
 
+FLEXIO_DEV_ALWAYS_INLINE flexio_dev_status_t flexio_dev_dbr_rq_inc_pi_value(uint32_t *rq_dbr, uint32_t value)
+{
+	uint32_t rq_rcv_counter;
+
+	rq_rcv_counter = be32_to_cpu(*rq_dbr);
+	*rq_dbr = cpu_to_be32((rq_rcv_counter + value) & 0xffff);
+	return FLEXIO_DEV_STATUS_SUCCESS;
+}
+
+static void dbr_rq_inc_pi_value_with_one_padding(rq_ctx_t *rq_ctx, uint32_t value) {
+    if (rq_ctx->first_doorbelled)
+        flexio_dev_dbr_rq_inc_pi_value(rq_ctx->rq_dbr, value);
+    else {
+        flexio_dev_dbr_rq_inc_pi_value(rq_ctx->rq_dbr, value - 1U);
+        rq_ctx->first_doorbelled = 1;
+    }
+}
+
 /* Initialize a per-thread context from the host data.
  *  ctx            - pointer to the app_device_ctx to initialize.
  *  data_from_host - pointer to host2dev_packet_processor_data from host.
@@ -120,8 +138,8 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 
 static void rxonly_packet(struct app_device_ctx *ctx)
 {
-	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
-	flexio_dev_dbr_rq_inc_pi(ctx->rq_ctx.rq_dbr);
+    /* just do nothing is fine */
+    (void) ctx;
 }
 
 
@@ -195,8 +213,6 @@ static void process_packet(struct app_device_ctx *ctx)
 	/* Ring DB */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	flexio_dev_qp_sq_ring_db(++ctx->sq_ctx.sq_pi, ctx->sq_ctx.sq_number);
-	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
-	flexio_dev_dbr_rq_inc_pi(ctx->rq_ctx.rq_dbr);
 }
 
 static void update_data_from_host(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
@@ -234,6 +250,8 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	}
 
     uint64_t last_packet_count = ctx->packets_count;
+    
+    uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
 	/* Poll CQ until the package is received. */
 	while (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) !=
@@ -249,13 +267,23 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		else
 			process_packet(ctx);
 		/* Update RQ CQ */
-		com_step_cq(&ctx->rq_cq_ctx);
+		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
+
+        #define DOORBELL_BURST 16U
+        if (ctx->packets_count - last_doorbelled_packet_count == DOORBELL_BURST) {
+            __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
+            dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, DOORBELL_BURST);
+            last_doorbelled_packet_count = ctx->packets_count;
+        }
 
         if (ctx->packets_count - last_packet_count > 10000) {
             last_packet_count = ctx->packets_count;
             update_data_from_host(data_from_host, ctx);
         }
 	}
+    __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
+    dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - last_doorbelled_packet_count));
+    last_doorbelled_packet_count = ctx->packets_count;
     update_data_from_host(data_from_host, ctx);
 
 	/* Update the memory to the chip */
