@@ -136,6 +136,42 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 	com_dt_ctx_init(&ctx->dt_ctx, data_from_host->sq_transf.wqd_daddr);
 }
 
+static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
+    if (!flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
+        return;
+    }
+
+    struct flexio_dev_cqe64 *mini_cqe_block = ctx->rq_cq_ctx.cqe;
+	uint32_t cq_idx_mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
+	struct flexio_dev_cqe64 *title_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 1U) & cq_idx_mask];
+
+    uint32_t mini_cqe_num = (uint32_t) flexio_dev_comp_cqe_get_num_comp_cqes(mini_cqe_block);
+
+    uint64_t mini_cqes[7] = {0};
+    for (uint32_t i = 0; i < mini_cqe_num; i++) {
+        mini_cqes[i] = flexio_dev_comp_cqe_get_comp_cqe(ctx->rq_cq_ctx.cqe, i);
+    }
+
+    struct flexio_dev_cqe64 *current_cqe = NULL;
+    uint8_t current_own_bit = flexio_dev_cqe_get_owner(title_cqe);
+    for (uint32_t i = 0; i < mini_cqe_num; i++) {
+        current_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx + i) & CQ_IDX_MASK];
+        current_own_bit = ((ctx->rq_cq_ctx.cq_idx + i) & CQ_IDX_MASK) ? current_own_bit : !current_own_bit;
+        
+        memcpy(current_cqe, title_cqe, 64);
+
+        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
+        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
+        current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i);
+
+        current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+    }
+
+    ctx->comp_packets_count += mini_cqe_num;
+}
+
+
+
 static void rxonly_packet(struct app_device_ctx *ctx)
 {
     /* just do nothing is fine */
@@ -253,6 +289,8 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     
     uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
+    decompress_if_cqe_is_compressed(ctx);
+
 	/* Poll CQ until the package is received. */
 	while (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) !=
 	       ctx->rq_cq_ctx.cq_hw_owner_bit) {
@@ -268,6 +306,8 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 			process_packet(ctx);
 		/* Update RQ CQ */
 		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
+
+        decompress_if_cqe_is_compressed(ctx);
 
         #define DOORBELL_BURST 16U
         if (ctx->packets_count - last_doorbelled_packet_count == DOORBELL_BURST) {
