@@ -86,9 +86,11 @@ struct host2dev_packet_processor_data {
 	struct app_transfer_cq sq_cq_transf;
 	/* SQ transfer information. */
 	struct app_transfer_wq sq_transf;
+    uint64_t report_packets_count;
 	uint32_t thread_index;   /* Index into device-side app_ctxs[] */
+    uint16_t  heartbeat;
 	uint8_t  not_first_run;
-	uint8_t  rsvd[3];
+	uint8_t  rxonly_enabled;
 } __attribute__((__packed__, aligned(8)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */

@@ -14,10 +14,11 @@
                 "__DPA_MEMORY=0",
                 "__DPA_W=0",
                 "__DPA_R=0",
-                "__DPA_RW=0"
+                "__DPA_RW=0",
+                "CLOCK_MONOTONIC=1"
             ],
             "compilerPath": "/usr/bin/gcc",
-            "cStandard": "c17",
+            "cStandard": "gnu17",
             "cppStandard": "gnu++17",
             "intelliSenseMode": "linux-gcc-arm64"
         }

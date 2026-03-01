@@ -34,8 +34,11 @@
  * initialization of a process and a event handler, and running event handler.
  */
 
-/* Used for geteuid function. */
+/* Used for geteuid and sleep functions. */
 #include <unistd.h>
+
+/* Used for SIGINT signal handling in the prompt loop. */
+#include <signal.h>
 
 /* Used for strtoul and other stdlib functions. */
 #include <stdlib.h>
@@ -67,6 +70,7 @@ extern flexio_func_t flexio_pp_dev;
 /* Per-thread resources: one event handler, one SQ/RQ pair, one set of steering rules. */
 struct thread_ctx {
 	uint32_t thread_index;
+    uint8_t rxonly_enable;
 
 	/* Event handler */
 	struct flexio_event_handler *pp_eh;
@@ -691,6 +695,27 @@ static int create_thread_event_handler(struct app_context *app_ctx, struct threa
 	return 0;
 }
 
+
+static int read_thread_h2d(struct app_context *ctx, struct thread_ctx *t, struct host2dev_packet_processor_data *h2d_snapshot)
+{
+	struct flexio_mem src = {0};
+	struct flexio_mem dst = {0};
+
+	src.mem_type = FLEXIO_MEMTYPE_DPA;
+	src.daddr = t->app_data_daddr;
+	dst.mem_type = FLEXIO_MEMTYPE_HOST;
+	dst.haddr = (uintptr_t)h2d_snapshot;
+
+	if (flexio_memcpy(ctx->flexio_process, &src, &dst, sizeof(struct host2dev_packet_processor_data)) !=
+	    FLEXIO_STATUS_SUCCESS) {
+		printf("Failed to read thread %u stats from DPA memory\n", t->thread_index);
+		return -1;
+	}
+
+	return 0;
+}
+
+
 /* Copy per-thread application information to DPA.
  * DPA side needs queue information in order to process the packets.
  * The DPA heap memory address will be passed as the event handler argument.
@@ -726,6 +751,8 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	h2d_data->thread_index = t->thread_index;
 	/* Set APP data info for first run. */
 	h2d_data->not_first_run = 0;
+	/* Propagate rxonly mode so the DPA thread calls the right packet handler. */
+	h2d_data->rxonly_enabled = t->rxonly_enable;
 
 	/* Copy to DPA heap memory.
 	 * Allocated DPA heap memory address will be kept in t->app_data_daddr.
@@ -894,6 +921,108 @@ static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	return err;
 }
 
+/* Set by SIGINT handler so the prompt loop exits cleanly on Ctrl-C. */
+static volatile int g_quit_prompt = 0;
+
+static void sigint_handler(int signum)
+{
+	(void)signum;
+	g_quit_prompt = 1;
+}
+
+/* Interactive prompt loop — displays real-time stats from all DPA threads.
+ * Installs a SIGINT handler so Ctrl-C exits cleanly.
+ * app_ctx - pointer to app_context holding the thread array and process handle.
+ * Returns 0 on success, -1 on error.
+ *
+ * Commands:
+ *   1 - show how many DPA threads are alive (heartbeat changed over 1 s)
+ *   2 - show total throughput in Mpps (packet count delta over 1 s)
+ *   0 - quit
+ *   <empty> / anything else - ignored
+ */
+static int system_prompt(struct app_context *app_ctx)
+{
+	struct sigaction sa = {0};
+	struct host2dev_packet_processor_data *snap_before, *snap_after;
+	char line[64];
+	int n = app_ctx->num_threads;
+	int i, cmd;
+	char *p;
+
+	/* Install SIGINT handler; return from this function when the process gets SIGINT. */
+	sa.sa_handler = sigint_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	if (sigaction(SIGINT, &sa, NULL) < 0) {
+		printf("Failed to install SIGINT handler\n");
+		return -1;
+	}
+
+	snap_before = calloc(n, sizeof(*snap_before));
+	snap_after  = calloc(n, sizeof(*snap_after));
+	if (!snap_before || !snap_after) {
+		free(snap_before);
+		free(snap_after);
+		printf("Failed to allocate snapshot buffers\n");
+		return -1;
+	}
+
+	printf("Commands: 1=alive threads  2=Mpps  0=quit\n");
+
+	while (!g_quit_prompt) {
+		printf("> ");
+		fflush(stdout);
+
+		if (!fgets(line, sizeof(line), stdin))
+			break;
+
+		/* Skip empty / whitespace-only input. */
+		p = line;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '\n' || *p == '\r' || *p == '\0')
+			continue;
+
+		cmd = atoi(p);
+
+		if (cmd == 0) {
+			break;
+		} else if (cmd == 1) {
+			/* Count alive threads: heartbeat must change within 1 second. */
+			int alive = 0;
+
+			for (i = 0; i < n; i++)
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
+			sleep(1);
+			for (i = 0; i < n; i++) {
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_after[i]);
+				if (snap_after[i].heartbeat != snap_before[i].heartbeat)
+					alive++;
+			}
+			printf("Alive DPA threads: %d / %d\n", alive, n);
+		} else if (cmd == 2) {
+			/* Measure aggregate packet rate over 1 second, display as Mpps. */
+			uint64_t total_pps = 0;
+
+			for (i = 0; i < n; i++)
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
+			sleep(1);
+			for (i = 0; i < n; i++) {
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_after[i]);
+				total_pps += snap_after[i].report_packets_count -
+					     snap_before[i].report_packets_count;
+			}
+			printf("Throughput: %.3f Mpps\n", (double)total_pps / 1e6);
+		}
+		/* else: ignore unrecognized input */
+	}
+
+	free(snap_before);
+	free(snap_after);
+	return 0;
+}
+
 /* dev msg stream buffer built from chunks of 2^FLEXIO_MSG_DEV_LOG_DATA_CHUNK_BSIZE each */
 #define MSG_HOST_BUFF_BSIZE (512 * L2V(FLEXIO_MSG_DEV_LOG_DATA_CHUNK_BSIZE))
 
@@ -922,10 +1051,12 @@ int main(int argc, char **argv)
 	int nic_mode = 0;
 	/* Number of DPA threads to create (default 1 for backward compatibility) */
 	uint32_t num_threads = 1;
+	/* RX-only mode: DPA threads consume packets without sending them back. */
+	int rxonly_enable = 0;
 	/* Loop index */
 	int i;
 	/* Buffer for fread */
-	char buf[2];
+	// char buf[2];
 	/* Execution status value. */
 	int err;
 
@@ -933,7 +1064,8 @@ int main(int argc, char **argv)
 
 	/* Check input includes at least a device name. */
 	if (argc < 2) {
-		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N]\n", argv[0]);
+		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off]\n",
+		       argv[0]);
 		return -1;
 	}
 
@@ -957,9 +1089,24 @@ int main(int argc, char **argv)
 			}
 			num_threads = (uint32_t)val;
 			i += 2;
+		} else if (!strcmp(argv[i], "--rxonly")) {
+			if (i + 1 >= argc) {
+				printf("--rxonly requires 'on' or 'off'\n");
+				return -1;
+			}
+			if (!strcmp(argv[i + 1], "on")) {
+				rxonly_enable = 1;
+			} else if (!strcmp(argv[i + 1], "off")) {
+				rxonly_enable = 0;
+			} else {
+				printf("--rxonly value must be 'on' or 'off'\n");
+				return -1;
+			}
+			i += 2;
 		} else {
 			printf("Unknown argument: %s\n", argv[i]);
-			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N]\n", argv[0]);
+			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off]\n",
+			       argv[0]);
 			return -1;
 		}
 	}
@@ -1076,6 +1223,7 @@ int main(int argc, char **argv)
 		struct thread_ctx *t = &app_ctx.threads[i];
 
 		t->thread_index = (uint32_t)i;
+		t->rxonly_enable = (uint8_t)rxonly_enable;
 
 		/* Create an event handler pinned to EU i (FLEXIO_AFFINITY_STRICT). */
 		if (create_thread_event_handler(&app_ctx, t)) {
@@ -1128,10 +1276,16 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Wait for Enter - the DPA sample is running in the meanwhile */
-	if (!fread(buf, 1, 1, stdin)) {
-		printf("Failed in fread\n");
-	}
+	// /* Wait for Enter - the DPA sample is running in the meanwhile */
+	// if (!fread(buf, 1, 1, stdin)) {
+		// printf("Failed in fread\n");
+	// }
+
+    if (system_prompt(&app_ctx)) {
+        printf("Failed to use system prompt");
+        err = -1;
+        goto cleanup;
+    }
 
 cleanup:
 	/* Clean up flow is done in reverse order of creation as there's a reference system

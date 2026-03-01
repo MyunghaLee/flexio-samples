@@ -116,6 +116,13 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 	com_dt_ctx_init(&ctx->dt_ctx, data_from_host->sq_transf.wqd_daddr);
 }
 
+static void rxonly_packet(struct app_device_ctx *ctx)
+{
+	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
+	flexio_dev_dbr_rq_inc_pi(ctx->rq_ctx.rq_dbr);
+}
+
+
 /* process packet - read it, swap MAC addresses, modify it, create a send WQE and send it back.
  *  ctx - pointer to the per-thread app_device_ctx.
  */
@@ -190,6 +197,12 @@ static void process_packet(struct app_device_ctx *ctx)
 	flexio_dev_dbr_rq_inc_pi(ctx->rq_ctx.rq_dbr);
 }
 
+static void update_data_from_host(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
+    data_from_host->report_packets_count = ctx->packets_count;
+    data_from_host->heartbeat++;
+    __dpa_thread_memory_writeback();
+}
+
 /* Entry point function that host side calls for execution.
  *  thread_arg - pointer to the host2dev_packet_processor_data structure
  *     to transfer data from the host side.
@@ -217,18 +230,31 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		data_from_host->not_first_run = 1;
 	}
 
+    uint64_t last_packet_count = ctx->packets_count;
+
 	/* Poll CQ until the package is received. */
 	while (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) !=
 	       ctx->rq_cq_ctx.cq_hw_owner_bit) {
 		/* Print the message */
 		// flexio_dev_print("Process packet: %ld\n", ctx->packets_count++);
+        ctx->packets_count++;
 		/* Update memory to DPA */
 		__dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
-		/* Process the packet */
-		process_packet(ctx);
+		/* Process or drop the packet based on rxonly mode. */
+		if (data_from_host->rxonly_enabled)
+			rxonly_packet(ctx);
+		else
+			process_packet(ctx);
 		/* Update RQ CQ */
 		com_step_cq(&ctx->rq_cq_ctx);
+
+        if (ctx->packets_count - last_packet_count > 10000) {
+            last_packet_count = ctx->packets_count;
+            update_data_from_host(data_from_host, ctx);
+        }
 	}
+    update_data_from_host(data_from_host, ctx);
+
 	/* Update the memory to the chip */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	/* Arming cq for next packet */
