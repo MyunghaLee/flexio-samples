@@ -43,8 +43,20 @@
 /* Used for strtoul and other stdlib functions. */
 #include <stdlib.h>
 
+/* Used for memcpy/memset/memcmp/strcmp. */
+#include <string.h>
+
 /* Used for host (x86/DPU) memory allocations. */
 #include <malloc.h>
+
+/* Used for host-side observer pthread. */
+#include <pthread.h>
+
+/* Used for htobe16/be16toh in host CQE decompression. */
+#include <endian.h>
+
+/* Used for clock_gettime in latency stats. */
+#include <time.h>
 
 /* Used for IBV device operations. */
 #include <infiniband/mlx5dv.h>
@@ -74,14 +86,22 @@ struct thread_ctx {
     uint8_t cqe_comp_enable;
     uint8_t hostbuf_enable;
     uint8_t zerocopy_enable;
+    uint8_t hostcq_enable;      /* 1 = RQ CQ ring in host memory (same window as data bufs) */
+    uint8_t hostdecomp_enable;  /* 1 = host observer decompresses CQEs for this thread */
 
-	/* Host buffer resources (used only when hostbuf_enable == 1) */
-	/* Combined buffer: RQ data occupies the first half, SQ data the second half.
-	 * A single ibv_reg_mr covers the whole region so both halves share one lkey,
-	 * allowing the DPA to access both via a single FlexIO window entity (ENTITY_0).
+	/* Host buffer resources (used only when hostbuf_enable == 1).
+	 * Combined buffer layout:
+	 *   [RQ data (Q_DATA_BSIZE) | SQ data (Q_DATA_BSIZE) | RQ CQ ring (CQ_BSIZE, if hostcq)]
+	 * A single ibv_reg_mr covers the whole region so all parts share one lkey,
+	 * allowing the DPA to access all via a single FlexIO window entity (ENTITY_0).
 	 */
-	void          *data_hbuf; /* combined host buffer (2 * Q_DATA_BSIZE) */
+	void          *data_hbuf; /* combined host buffer */
 	struct ibv_mr *data_mr;   /* single MR covering the combined buffer */
+
+	/* DEVX UMEM registration for the RQ CQ ring portion of the combined buffer.
+	 * Needed for flexio_cq_create with FLEXIO_MEMTYPE_HOST qmem (hostcq mode only).
+	 */
+	struct mlx5dv_devx_umem *rq_cq_ring_umem;
 
 	/* Event handler */
 	struct flexio_event_handler *pp_eh;
@@ -138,6 +158,70 @@ struct app_context {
 	struct thread_ctx *threads;
 	/* FlexIO window for DPA→host memory access (created when --hostbuf on). */
 	struct flexio_window *window;
+};
+
+/* Host-side 64B CQE layout used by the hostdecomp observer. */
+struct host_cqe64 {
+	uint32_t rsvd00[5];
+	uint16_t csum_ok;
+	uint8_t  rsvd22[2];
+	uint32_t rsvd24[2];
+	uint32_t srqn_uidx;
+	uint32_t imm_inval_pkey;
+	uint32_t rsvd40;
+	uint32_t byte_cnt;
+	uint32_t rsvd48;
+	uint8_t  hw_err_syndrome;
+	uint8_t  rsvd50;
+	uint8_t  vendor_err_synd;
+	uint8_t  syndrome;
+	union {
+		struct {
+			uint8_t sop_rdrop;
+			uint8_t qpn24[3];
+		};
+		uint32_t qpn;
+	};
+	uint16_t wqe_counter;
+	union {
+		uint8_t signature;
+		uint8_t validity_iteration_count;
+	};
+	uint8_t op_own;
+} __attribute__((__packed__, aligned(8)));
+
+/* Mini CQE block overlay (64B compressed CQE block). */
+struct host_mini_cqe64 {
+	uint64_t mini_cqe[7];
+	uint8_t  rsvd0[6];
+	uint8_t  validity_iteration_count;
+	uint8_t  num_and_type;
+} __attribute__((__packed__, aligned(8)));
+
+/* Per-DPA-thread state for the host decompression observer. */
+struct hostdecomp_queue_ctx {
+	struct host_cqe64 *cq_ring_haddr; /* host pointer to the CQ ring */
+	uint32_t thread_index;
+	uint32_t cq_idx;
+	uint32_t log_cq_depth;
+	uint8_t  cq_hw_owner_bit;
+	int      enabled;                  /* 1 if this thread uses hostdecomp */
+	uint8_t  has_title_cqe;
+	struct host_cqe64 title_cqe;
+	int      no_title_warned;
+	uint64_t decomp_total_ns;
+	uint64_t decomp_total_mini;
+	uint64_t decomp_last_report_mini;
+};
+
+/* Single host observer that rotates across all DPA threads' CQ rings. */
+struct hostdecomp_ctx {
+	struct hostdecomp_queue_ctx *queues;
+	uint32_t num_queues;
+	uint32_t next_queue_idx;
+	pthread_t thread;
+	int thread_started;
+	volatile int stop;
 };
 
 /* Open ibv device
@@ -346,6 +430,59 @@ static int cq_mem_alloc(struct flexio_process *process, struct app_transfer_cq *
 	return ret;
 }
 
+/* Allocate RQ CQ memory with ring in host memory (within combined data buffer, hostcq mode).
+ * The combined buffer must have been allocated by sq_mem_alloc_hostbuf before this call.
+ * Only allocates CQ DBR on DPA heap; the ring resides at data_hbuf + 2*Q_DATA_BSIZE.
+ * Registers a DEVX UMEM for the ring so flexio_cq_create can use FLEXIO_MEMTYPE_HOST.
+ * Returns 0 on success and -1 on failure.
+ * app_ctx - pointer to app_context structure.
+ * t       - pointer to thread_ctx for this thread.
+ */
+static int rq_cq_mem_alloc_host(struct app_context *app_ctx, struct thread_ctx *t)
+{
+	struct flexio_process *process = app_ctx->flexio_process;
+	__be32 dbr[2] = { 0, 0 };
+	struct mlx5_cqe64 *cqe_p;
+	void *cq_ring_ptr;
+	uint32_t i;
+
+	if (!t->data_hbuf) {
+		printf("rq_cq_mem_alloc_host: combined buffer not allocated\n");
+		return -1;
+	}
+
+	/* Allocate CQ DBR on DPA heap (DPA increments consumer index directly). */
+	if (flexio_copy_from_host(process, dbr, sizeof(dbr),
+				  &t->rq_cq_transf.cq_dbr_daddr)) {
+		printf("Failed to allocate RQ CQ DBR on DPA heap.\n");
+		return -1;
+	}
+
+	/* CQ ring occupies the third region of the combined buffer. */
+	cq_ring_ptr = (char *)t->data_hbuf + 2 * Q_DATA_BSIZE;
+
+	/* Initialize CQEs: zero-fill then set owner bit = 1 (HW-owned initial state). */
+	memset(cq_ring_ptr, 0, CQ_BSIZE);
+	for (i = 0, cqe_p = (struct mlx5_cqe64 *)cq_ring_ptr; i < Q_DEPTH; i++)
+		mlx5dv_set_cqe_owner(cqe_p++, 1);
+
+	/* Register a DEVX UMEM covering just the CQ ring portion.
+	 * humem_offset = 0 because this UMEM starts at the CQ ring start address.
+	 */
+	t->rq_cq_ring_umem = mlx5dv_devx_umem_reg(app_ctx->ibv_ctx, cq_ring_ptr, CQ_BSIZE,
+						   IBV_ACCESS_LOCAL_WRITE);
+	if (!t->rq_cq_ring_umem) {
+		printf("Failed to register DEVX UMEM for host RQ CQ ring.\n");
+		flexio_buf_dev_free(process, t->rq_cq_transf.cq_dbr_daddr);
+		t->rq_cq_transf.cq_dbr_daddr = 0;
+		return -1;
+	}
+
+	/* cq_ring_daddr = 0: host VA is passed to DPA in copy_thread_data_to_dpa. */
+	t->rq_cq_transf.cq_ring_daddr = 0;
+	return 0;
+}
+
 /* SQ WQE byte size is 64B. */
 #define LOG_SQ_WQE_BSIZE 6
 /* SQ WQE byte size log to value. */
@@ -384,17 +521,23 @@ static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 static int sq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *t,
 				struct app_transfer_wq *sq_transf)
 {
-	/* Allocate one combined 64-byte-aligned buffer: first half = RQ, second half = SQ. */
-	if (posix_memalign(&t->data_hbuf, 64, 2 * Q_DATA_BSIZE)) {
-		printf("Failed to allocate host memory for combined RQ+SQ data buffer\n");
+	/* When hostcq is also enabled, append a CQ ring after RQ+SQ data.
+	 * Layout: [RQ data (Q_DATA_BSIZE) | SQ data (Q_DATA_BSIZE) | CQ ring (CQ_BSIZE)]
+	 * A single ibv_reg_mr covers all three regions under one lkey.
+	 */
+	size_t hbuf_size = t->hostcq_enable ? (2 * Q_DATA_BSIZE + CQ_BSIZE) : (2 * Q_DATA_BSIZE);
+
+	if (posix_memalign(&t->data_hbuf, 64, hbuf_size)) {
+		printf("Failed to allocate host memory for combined data buffer\n");
 		return -1;
 	}
+	memset(t->data_hbuf, 0, hbuf_size);
 
 	/* Register a single MR covering the combined buffer.
 	 * NIC needs REMOTE_WRITE to DMA packets into the RQ half and REMOTE_READ to
 	 * fetch packet data from the SQ half. LOCAL_WRITE is required by the verbs API.
 	 */
-	t->data_mr = ibv_reg_mr(app_ctx->process_pd, t->data_hbuf, 2 * Q_DATA_BSIZE,
+	t->data_mr = ibv_reg_mr(app_ctx->process_pd, t->data_hbuf, hbuf_size,
 			       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
 			       IBV_ACCESS_REMOTE_READ);
 	if (!t->data_mr) {
@@ -674,8 +817,13 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	/* RQ's CQ number. */
 	uint32_t cq_num;
 
-	/* Allocate CQ memory (ring and DBR) on DPA heap memory. */
-	if (cq_mem_alloc(app_fp, &t->rq_cq_transf)) {
+	/* Allocate CQ memory: ring in host memory when hostcq, else on DPA heap. */
+	if (t->hostcq_enable) {
+		if (rq_cq_mem_alloc_host(app_ctx, t)) {
+			printf("Failed to alloc host memory for RQ's CQ.\n");
+			return -1;
+		}
+	} else if (cq_mem_alloc(app_fp, &t->rq_cq_transf)) {
 		printf("Failed to alloc memory for RQ's CQ.\n");
 		return -1;
 	}
@@ -693,16 +841,18 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	 * This will allow updating/arming the CQ from the DPA side.
 	 */
 	rqcq_attr.uar_id = uar_id;
-	/* Set CQ DBR memory. DBR memory is on the DPA side in order to allow direct access from
-	 * DPA.
-	 */
+	/* CQ DBR always on DPA heap for direct DPA access. */
 	rqcq_attr.cq_dbr_daddr = t->rq_cq_transf.cq_dbr_daddr;
-	/* Set CQ ring memory. Ring memory is on the DPA side in order to allow reading CQEs from
-	 * DPA during packet forwarding.
-	 */
-	rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
+	/* CQ ring: host UMEM when hostcq, else DPA heap. */
+	if (t->hostcq_enable) {
+		rqcq_attr.cq_ring_qmem.memtype    = FLEXIO_MEMTYPE_HOST;
+		rqcq_attr.cq_ring_qmem.humem_offset = 0;
+		rqcq_attr.cq_ring_qmem.umem_id    = t->rq_cq_ring_umem->umem_id;
+	} else {
+		rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
+	}
 
-    rqcq_attr.cqe_comp_type = t->cqe_comp_enable ? FLEXIO_CQE_COMP_ENABLE : FLEXIO_CQE_COMP_NONE;
+	rqcq_attr.cqe_comp_type = t->cqe_comp_enable ? FLEXIO_CQE_COMP_ENABLE : FLEXIO_CQE_COMP_NONE;
 	/* Create CQ for RQ. */
 	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
@@ -852,10 +1002,18 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	h2d_data->not_first_run = 0;
 	/* Propagate rxonly mode so the DPA thread calls the right packet handler. */
 	h2d_data->rxonly_enabled = t->rxonly_enable;
-	/* Propagate host-buffer mode, window ID, and zero-copy mode to DPA. */
+	/* Propagate host-buffer mode, window ID, zero-copy, hostcq, and hostdecomp to DPA. */
 	h2d_data->hostbuf_enabled = t->hostbuf_enable;
 	h2d_data->zerocopy_enabled = t->zerocopy_enable;
+	h2d_data->hostcq_enabled = t->hostcq_enable;
+	h2d_data->hostdecomp_enabled = t->hostdecomp_enable;
 	h2d_data->window_id = app_ctx->window ? flexio_window_get_id(app_ctx->window) : 0;
+	/* When hostcq is on, pass the host VA of the CQ ring in cq_ring_daddr.
+	 * DPA interprets this as a host VA to map through the window.
+	 */
+	if (t->hostcq_enable)
+		h2d_data->rq_cq_transf.cq_ring_daddr =
+			(flexio_uintptr_t)(uintptr_t)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
 
 	/* Copy to DPA heap memory.
 	 * Allocated DPA heap memory address will be kept in t->app_data_daddr.
@@ -961,6 +1119,18 @@ static int clean_up_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 		err = -1;
 	}
 
+	/* Deregister DEVX UMEM for host CQ ring after CQ is destroyed (hostcq mode).
+	 * The backing memory (combined buffer) is freed later in clean_up_thread_sq.
+	 */
+	if (t->rq_cq_ring_umem && mlx5dv_devx_umem_dereg(t->rq_cq_ring_umem)) {
+		printf("Failed to deregister UMEM for host RQ CQ ring\n");
+		err = -1;
+	}
+
+	/* Free DPA heap CQ ring memory (non-hostcq mode only).
+	 * When hostcq is on, cq_ring_daddr holds the host VA (= 0 in our tracking),
+	 * so this condition is always false and we skip the free safely.
+	 */
 	if (t->rq_cq_transf.cq_ring_daddr &&
 	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_cq_transf.cq_ring_daddr)) {
 		printf("Failed to free rq_cq_transf.cq_ring_daddr\n");
@@ -1161,6 +1331,294 @@ static int system_prompt(struct app_context *app_ctx)
 	return 0;
 }
 
+/* Host decompression latency report interval (in number of mini-CQEs). */
+#define HOST_DECOMP_LAT_REPORT_MINI 1000000ULL
+
+static uint64_t host_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+static uint8_t host_cqe_get_owner(const struct host_cqe64 *cqe)
+{
+	return cqe->op_own & 0x1;
+}
+
+static uint8_t host_comp_cqe_is_comp_cqe_array(const struct host_cqe64 *cqe)
+{
+	const struct host_mini_cqe64 *mini = (const struct host_mini_cqe64 *)cqe;
+
+	return ((mini->num_and_type >> 2) & 0x3) == 0x3;
+}
+
+static uint8_t host_comp_cqe_get_num_comp_cqes(const struct host_cqe64 *cqe)
+{
+	const struct host_mini_cqe64 *mini = (const struct host_mini_cqe64 *)cqe;
+
+	return (mini->num_and_type >> 4) + 1;
+}
+
+static struct host_cqe64 *hostdecomp_entry_haddr(struct hostdecomp_queue_ctx *qctx,
+						  uint32_t cq_idx)
+{
+	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
+
+	return &qctx->cq_ring_haddr[cq_idx & mask];
+}
+
+static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
+{
+	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
+	uint32_t i;
+
+	for (i = 0; i < cqes; i++) {
+		qctx->cq_idx++;
+		if (!(qctx->cq_idx & mask))
+			qctx->cq_hw_owner_bit = !qctx->cq_hw_owner_bit;
+	}
+}
+
+/* Decompress a compressed CQE block in-place in host memory.
+ * Mirrors the DPA-side decompress_if_cqe_is_compressed logic but runs on host CPU.
+ * Returns 0 on success, -1 if no title CQE is available.
+ */
+static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
+					 const struct host_cqe64 *compressed_cqe,
+					 uint32_t mini_cqe_num)
+{
+	const struct host_mini_cqe64 *mini = (const struct host_mini_cqe64 *)compressed_cqe;
+	uint64_t mini_cqes[7] = {0};
+	uint8_t current_own_bit;
+	uint32_t i;
+
+	if (!qctx->has_title_cqe)
+		return -1;
+	if (!mini_cqe_num)
+		return 0;
+	if (mini_cqe_num > 7)
+		mini_cqe_num = 7;
+
+	/* Temporarily hide the compressed entry from DPA by setting the wrong owner bit.
+	 * This prevents DPA from reading a partially-written CQE block.
+	 */
+	{
+		struct host_cqe64 *head = hostdecomp_entry_haddr(qctx, qctx->cq_idx);
+
+		head->op_own = (uint8_t)((head->op_own & (uint8_t)~0x1u) |
+					 (qctx->cq_hw_owner_bit & 0x1u));
+		__atomic_thread_fence(__ATOMIC_RELEASE);
+	}
+
+	for (i = 0; i < mini_cqe_num; i++)
+		mini_cqes[i] = mini->mini_cqe[i];
+
+	current_own_bit = host_cqe_get_owner(&qctx->title_cqe);
+	for (i = 0; i < mini_cqe_num; i++) {
+		uint32_t target_idx = qctx->cq_idx + i;
+		uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
+		struct host_cqe64 *current_cqe = hostdecomp_entry_haddr(qctx, target_idx);
+
+		/* Owner bit flips when the consumer index wraps around. */
+		current_own_bit = (target_idx & mask) ? current_own_bit
+						       : (uint8_t)!current_own_bit;
+
+		memcpy(current_cqe, &qctx->title_cqe, sizeof(*current_cqe));
+		current_cqe->byte_cnt    = (uint32_t)((mini_cqes[i] >> 32) & 0xFFFFFFFFULL);
+		current_cqe->rsvd00[3]   = (uint32_t)(mini_cqes[i] & 0xFFFFFFFFULL);
+		current_cqe->wqe_counter = htobe16(
+			(uint16_t)(be16toh(qctx->title_cqe.wqe_counter) + i + 1u));
+		current_cqe->op_own = (uint8_t)((current_cqe->op_own & (uint8_t)~0x1u) |
+					         (current_own_bit & 0x1u));
+
+		/* Keep title_cqe updated to the last decompressed entry. */
+		if (i + 1 == mini_cqe_num)
+			memcpy(&qctx->title_cqe, current_cqe, sizeof(qctx->title_cqe));
+	}
+
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	return 0;
+}
+
+/* Host observer thread: rotates across all DPA threads' host-memory CQ rings.
+ * When a compressed CQE block is found it decompresses in-place so the DPA can
+ * process the resulting regular CQEs on its next invocation.
+ */
+static void *hostdecomp_poll_thread(void *arg)
+{
+	struct hostdecomp_ctx *ctx = arg;
+	struct host_cqe64 first = {0}, second = {0};
+	uint32_t mini_cqe_num;
+	struct hostdecomp_queue_ctx *qctx;
+
+	if (!ctx->num_queues || !ctx->queues)
+		return NULL;
+
+	while (!ctx->stop) {
+		qctx = &ctx->queues[ctx->next_queue_idx];
+
+		if (!qctx->enabled) {
+			ctx->next_queue_idx = (ctx->next_queue_idx + 1) % ctx->num_queues;
+			continue;
+		}
+
+		/* Read the current CQE twice and require a stable snapshot to avoid
+		 * acting on a torn entry while the NIC is writing it.
+		 */
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		memcpy(&first,  hostdecomp_entry_haddr(qctx, qctx->cq_idx), sizeof(first));
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		memcpy(&second, hostdecomp_entry_haddr(qctx, qctx->cq_idx), sizeof(second));
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+
+		if (memcmp(&first, &second, sizeof(first)))
+			continue; /* Torn read — retry same queue */
+
+		/* CQE not yet written by NIC (owner matches SW-expected bit) and not
+		 * a compressed block: move to the next thread's queue.
+		 */
+		if (host_cqe_get_owner(&second) == qctx->cq_hw_owner_bit &&
+		    !host_comp_cqe_is_comp_cqe_array(&second)) {
+			ctx->next_queue_idx = (ctx->next_queue_idx + 1) % ctx->num_queues;
+			continue;
+		}
+
+		if (host_comp_cqe_is_comp_cqe_array(&second)) {
+			mini_cqe_num = host_comp_cqe_get_num_comp_cqes(&second);
+
+			uint64_t t0 = host_now_ns();
+			uint64_t elapsed;
+
+			if (hostdecomp_decompress_current(qctx, &second, mini_cqe_num)) {
+				if (!qctx->no_title_warned) {
+					printf("hostdecomp: no title CQE for thread %u cq_idx=%u\n",
+					       qctx->thread_index, qctx->cq_idx);
+					qctx->no_title_warned = 1;
+				}
+				ctx->next_queue_idx = (ctx->next_queue_idx + 1) % ctx->num_queues;
+				continue;
+			}
+
+			qctx->no_title_warned = 0;
+			elapsed = host_now_ns() - t0;
+			qctx->decomp_total_ns   += elapsed;
+			qctx->decomp_total_mini += mini_cqe_num;
+
+			if ((qctx->decomp_total_mini - qctx->decomp_last_report_mini) >=
+			    HOST_DECOMP_LAT_REPORT_MINI) {
+				printf("hostdecomp latency: thread=%u avg=%llu ns/mini samples=%llu\n",
+				       qctx->thread_index,
+				       (unsigned long long)(qctx->decomp_total_ns /
+							    qctx->decomp_total_mini),
+				       (unsigned long long)qctx->decomp_total_mini);
+				qctx->decomp_last_report_mini = qctx->decomp_total_mini;
+			}
+
+			hostdecomp_advance(qctx, mini_cqe_num);
+			continue;
+		}
+
+		/* Regular title CQE — save it for use as the template when decompressing
+		 * the next compressed block.
+		 */
+		qctx->title_cqe     = second;
+		qctx->has_title_cqe = 1;
+		qctx->no_title_warned = 0;
+		hostdecomp_advance(qctx, 1);
+	}
+
+	return NULL;
+}
+
+/* Start the host decompression observer for all threads that have hostdecomp_enable set.
+ * Returns 0 on success (including the case where no threads need it), -1 on error.
+ */
+static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_ctx)
+{
+	uint32_t i, active = 0;
+
+	memset(ctx, 0, sizeof(*ctx));
+
+	for (i = 0; i < (uint32_t)app_ctx->num_threads; i++) {
+		if (app_ctx->threads[i].hostdecomp_enable)
+			active++;
+	}
+	if (!active)
+		return 0;
+
+	ctx->queues = calloc(app_ctx->num_threads, sizeof(*ctx->queues));
+	if (!ctx->queues) {
+		printf("hostdecomp: failed to allocate queue contexts\n");
+		return -1;
+	}
+	ctx->num_queues = (uint32_t)app_ctx->num_threads;
+
+	for (i = 0; i < (uint32_t)app_ctx->num_threads; i++) {
+		struct hostdecomp_queue_ctx *qctx = &ctx->queues[i];
+		struct thread_ctx *t = &app_ctx->threads[i];
+
+		qctx->enabled = t->hostdecomp_enable;
+		if (!qctx->enabled)
+			continue;
+
+		/* CQ ring is at offset 2*Q_DATA_BSIZE within the combined buffer. */
+		qctx->cq_ring_haddr  = (struct host_cqe64 *)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
+		qctx->thread_index   = t->thread_index;
+		qctx->cq_idx         = 0;
+		qctx->log_cq_depth   = LOG_Q_DEPTH;
+		/* Initial HW owner bit = 1: CQEs are initialised to owner=1, meaning
+		 * they are NOT ready (owner == cq_hw_owner_bit means empty).
+		 */
+		qctx->cq_hw_owner_bit = 1;
+	}
+
+	if (pthread_create(&ctx->thread, NULL, hostdecomp_poll_thread, ctx)) {
+		printf("hostdecomp: failed to start observer thread\n");
+		free(ctx->queues);
+		ctx->queues     = NULL;
+		ctx->num_queues = 0;
+		return -1;
+	}
+
+	ctx->thread_started = 1;
+	printf("hostdecomp observer started for %u DPA thread(s)\n", active);
+	return 0;
+}
+
+/* Stop the host decompression observer thread and print final latency stats. */
+static int hostdecomp_stop(struct hostdecomp_ctx *ctx)
+{
+	uint32_t i;
+
+	if (!ctx->thread_started)
+		return 0;
+
+	ctx->stop = 1;
+	if (pthread_join(ctx->thread, NULL)) {
+		printf("hostdecomp: failed to join observer thread\n");
+		return -1;
+	}
+
+	for (i = 0; i < ctx->num_queues; i++) {
+		struct hostdecomp_queue_ctx *qctx = &ctx->queues[i];
+
+		if (!qctx->enabled || !qctx->decomp_total_mini)
+			continue;
+		printf("hostdecomp final: thread=%u avg=%llu ns/mini samples=%llu\n",
+		       qctx->thread_index,
+		       (unsigned long long)(qctx->decomp_total_ns / qctx->decomp_total_mini),
+		       (unsigned long long)qctx->decomp_total_mini);
+	}
+
+	free(ctx->queues);
+	ctx->queues         = NULL;
+	ctx->num_queues     = 0;
+	ctx->thread_started = 0;
+	return 0;
+}
+
 /* dev msg stream buffer built from chunks of 2^FLEXIO_MSG_DEV_LOG_DATA_CHUNK_BSIZE each */
 #define MSG_HOST_BUFF_BSIZE (512 * L2V(FLEXIO_MSG_DEV_LOG_DATA_CHUNK_BSIZE))
 
@@ -1197,6 +1655,12 @@ int main(int argc, char **argv)
 	int hostbuf_enable = 0;
 	/* Zero-copy mode: forward RQ buffer directly to TX without memcpy. */
 	int zerocopy_enable = 0;
+	/* Host CQ mode: RQ CQ ring placed in host memory (same window as data buffers). */
+	int hostcq_enable = 0;
+	/* Host decomp mode: host observer thread decompresses CQEs for DPA threads. */
+	int hostdecomp_enable = 0;
+	/* Host decomp observer context. */
+	struct hostdecomp_ctx hostdecomp_ctx = {0};
 	/* Loop index */
 	int i;
 	/* Buffer for fread */
@@ -1208,7 +1672,7 @@ int main(int argc, char **argv)
 
 	/* Check input includes at least a device name. */
 	if (argc < 2) {
-		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off]\n",
+		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
 		       argv[0]);
 		return -1;
 	}
@@ -1289,13 +1753,52 @@ int main(int argc, char **argv)
 				return -1;
 			}
 			i += 2;
+		} else if (!strcmp(argv[i], "--hostcq")) {
+			if (i + 1 >= argc) {
+				printf("--hostcq requires 'on' or 'off'\n");
+				return -1;
+			}
+			if (!strcmp(argv[i + 1], "on")) {
+				hostcq_enable = 1;
+			} else if (!strcmp(argv[i + 1], "off")) {
+				hostcq_enable = 0;
+			} else {
+				printf("--hostcq value must be 'on' or 'off'\n");
+				return -1;
+			}
+			i += 2;
+		} else if (!strcmp(argv[i], "--hostdecomp")) {
+			if (i + 1 >= argc) {
+				printf("--hostdecomp requires 'on' or 'off'\n");
+				return -1;
+			}
+			if (!strcmp(argv[i + 1], "on")) {
+				hostdecomp_enable = 1;
+			} else if (!strcmp(argv[i + 1], "off")) {
+				hostdecomp_enable = 0;
+			} else {
+				printf("--hostdecomp value must be 'on' or 'off'\n");
+				return -1;
+			}
+			i += 2;
 		} else {
 			printf("Unknown argument: %s\n", argv[i]);
-			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off]\n",
+			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
 			       argv[0]);
 			return -1;
 		}
 	}
+
+	/* Validate mode dependencies: hostdecomp requires hostcq, hostcq requires hostbuf. */
+	if (hostdecomp_enable && !hostcq_enable) {
+		printf("--hostdecomp on requires --hostcq on\n");
+		return -1;
+	}
+	if (hostcq_enable && !hostbuf_enable) {
+		printf("--hostcq on requires --hostbuf on\n");
+		return -1;
+	}
+
 	app_ctx.num_threads = (int)num_threads;
 
 	/* Check if the application run with root privileges */
@@ -1417,11 +1920,13 @@ int main(int argc, char **argv)
 	for (i = 0; i < app_ctx.num_threads; i++) {
 		struct thread_ctx *t = &app_ctx.threads[i];
 
-		t->thread_index = (uint32_t)i;
-		t->rxonly_enable = (uint8_t)rxonly_enable;
+		t->thread_index    = (uint32_t)i;
+		t->rxonly_enable   = (uint8_t)rxonly_enable;
 		t->cqe_comp_enable = (uint8_t)cqe_comp_enable;
-		t->hostbuf_enable = (uint8_t)hostbuf_enable;
+		t->hostbuf_enable  = (uint8_t)hostbuf_enable;
 		t->zerocopy_enable = (uint8_t)zerocopy_enable;
+		t->hostcq_enable   = (uint8_t)hostcq_enable;
+		t->hostdecomp_enable = (uint8_t)hostdecomp_enable;
 
 		/* Create an event handler pinned to EU i (FLEXIO_AFFINITY_STRICT). */
 		if (create_thread_event_handler(&app_ctx, t)) {
@@ -1479,13 +1984,25 @@ int main(int argc, char **argv)
 		// printf("Failed in fread\n");
 	// }
 
-    if (system_prompt(&app_ctx)) {
-        printf("Failed to use system prompt");
-        err = -1;
-        goto cleanup;
-    }
+	/* Start host decompression observer (no-op when hostdecomp_enable == 0). */
+	if (hostdecomp_start(&hostdecomp_ctx, &app_ctx)) {
+		printf("Failed to start hostdecomp observer\n");
+		err = -1;
+		goto cleanup;
+	}
+
+	if (system_prompt(&app_ctx)) {
+		printf("Failed to use system prompt");
+		err = -1;
+		goto cleanup;
+	}
 
 cleanup:
+	/* Stop the host decompression observer before tearing down hardware resources. */
+	if (hostdecomp_stop(&hostdecomp_ctx)) {
+		printf("Failed to stop hostdecomp observer\n");
+		err = -1;
+	}
 	/* Clean up flow is done in reverse order of creation as there's a reference system
 	 * that won't allow destroying resources that has references to existing resources.
 	 */
@@ -1508,15 +2025,18 @@ cleanup:
 				err = -1;
 		}
 
-		/* Destroy SQ resources (reverse order). */
+		/* Destroy RQ resources first (reverse order).
+		 * Must precede SQ cleanup so the DEVX UMEM for the host CQ ring is
+		 * deregistered before the combined buffer (owned by the SQ side) is freed.
+		 */
 		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
-			if (clean_up_thread_sq(&app_ctx, &app_ctx.threads[i]))
+			if (clean_up_thread_rq(&app_ctx, &app_ctx.threads[i]))
 				err = -1;
 		}
 
-		/* Destroy RQ resources (reverse order). */
+		/* Destroy SQ resources (reverse order). */
 		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
-			if (clean_up_thread_rq(&app_ctx, &app_ctx.threads[i]))
+			if (clean_up_thread_sq(&app_ctx, &app_ctx.threads[i]))
 				err = -1;
 		}
 

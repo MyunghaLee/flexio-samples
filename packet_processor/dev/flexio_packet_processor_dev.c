@@ -74,11 +74,14 @@ struct app_device_ctx {
 	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
 	uint8_t  hostbuf_enabled;
 	uint8_t  zerocopy_enabled;   /* 1 = forward RQ buffer directly without memcpy */
+    uint8_t  hostcq_enabled;
+    uint8_t  hostdecomp_enabled;
 	uint32_t window_id;          /* FlexIO window ID */
 	uint32_t rqd_mkey;           /* ibv lkey for RQ data buffer */
 	uint32_t sqd_mkey;           /* ibv lkey for SQ data buffer */
 	uint64_t rqd_haddr_base;     /* host VA base of RQ data buffer */
 	uint64_t sqd_haddr_base;     /* host VA base of SQ data buffer */
+	uint64_t rqcq_haddr_base;        /* host VA of RQ CQ ring (hostcq mode) */
 	/* Per-invocation DPA window pointers (set at start of each handler call) */
 	flexio_uintptr_t rqd_dpa_base;
 	flexio_uintptr_t sqd_dpa_base;
@@ -122,6 +125,8 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 	/* Initialize host buffer mode fields. */
 	ctx->hostbuf_enabled = data_from_host->hostbuf_enabled;
 	ctx->zerocopy_enabled = data_from_host->zerocopy_enabled;
+	ctx->hostcq_enabled = data_from_host->hostcq_enabled;
+	ctx->hostdecomp_enabled = data_from_host->hostdecomp_enabled;
 	if (data_from_host->hostbuf_enabled) {
 		ctx->window_id = data_from_host->window_id;
 		ctx->rqd_mkey = data_from_host->rq_transf.wqd_mkey_id;
@@ -130,11 +135,21 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 		ctx->sqd_haddr_base = data_from_host->sq_transf.wqd_daddr;
 	}
 
-	/* Set context for RQ's CQ */
+	/* When hostcq is on, the CQ ring is in host memory within the combined buffer.
+	 * Save the host VA; cq_ring/cqe pointers are updated per-invocation after
+	 * window_ptr_acquire (window state resets between invocations).
+	 */
+	if (data_from_host->hostcq_enabled)
+		ctx->rqcq_haddr_base = data_from_host->rq_cq_transf.cq_ring_daddr;
+
+	/* Set context for RQ's CQ.
+	 * When hostcq: pass 0 for cq_ring_daddr — it is set to the window-mapped
+	 * DPA address every invocation in the per-invocation window block below.
+	 */
 	com_cq_ctx_init(&ctx->rq_cq_ctx,
 			data_from_host->rq_cq_transf.cq_num,
 			data_from_host->rq_cq_transf.log_cq_depth,
-			data_from_host->rq_cq_transf.cq_ring_daddr,
+			data_from_host->hostcq_enabled ? 0 : data_from_host->rq_cq_transf.cq_ring_daddr,
 			data_from_host->rq_cq_transf.cq_dbr_daddr);
 
 	/* Set context for RQ */
@@ -185,7 +200,7 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
 
         current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
         current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i);
+        current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i + 1U);
 
         current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
     }
@@ -193,6 +208,18 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
     ctx->comp_packets_count += mini_cqe_num;
 }
 
+static int decompress_wrapper(struct app_device_ctx *ctx) {
+    int ret = 0;
+
+    if (ctx->hostcq_enabled) __dpa_thread_window_read_inv();
+
+    if (!ctx->hostdecomp_enabled) decompress_if_cqe_is_compressed(ctx);
+    else if (flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) ret = -1;
+
+    if (ctx->hostcq_enabled) __dpa_thread_window_writeback();
+
+    return ret;
+}
 
 
 static void rxonly_packet(struct app_device_ctx *ctx)
@@ -309,10 +336,16 @@ static void process_packet(struct app_device_ctx *ctx)
 	flexio_dev_qp_sq_ring_db(++ctx->sq_ctx.sq_pi, ctx->sq_ctx.sq_number);
 }
 
-static void update_data_from_host(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
+static void update_data_from_host_report(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
     data_from_host->report_packets_count = ctx->packets_count;
     data_from_host->report_comp_packets_count = ctx->comp_packets_count;
     data_from_host->heartbeat++;
+    __dpa_thread_memory_writeback();
+}
+
+static void update_data_from_host_cq_idx(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
+    if (!ctx->hostdecomp_enabled) return;
+    data_from_host->dpa_current_cq_idx = ctx->rq_cq_ctx.cq_idx;
     __dpa_thread_memory_writeback();
 }
 
@@ -340,6 +373,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	/* If the thread is executed for first time, then initialize the context. */
 	if (!data_from_host->not_first_run) {
 		app_ctx_init(ctx, data_from_host);
+        update_data_from_host_cq_idx(data_from_host, ctx);
 		data_from_host->not_first_run = 1;
 	}
 
@@ -349,20 +383,31 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	 * Acquire a DPA window pointer for the combined buffer base (= RQ half start),
 	 * then derive the SQ base pointer as an offset within the same window.
 	 */
-	if (ctx->hostbuf_enabled) {
+	if (ctx->hostbuf_enabled || ctx->hostcq_enabled) {
 		flexio_uintptr_t combined_dpa_base;
 
 		flexio_dev_window_config(FLEXIO_DEV_WINDOW_ENTITY_0, ctx->window_id, ctx->rqd_mkey);
 		flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0, ctx->rqd_haddr_base, &combined_dpa_base);
 		ctx->rqd_dpa_base = combined_dpa_base;
 		ctx->sqd_dpa_base = combined_dpa_base + (ctx->sqd_haddr_base - ctx->rqd_haddr_base);
+
+		/* When hostcq is on, the CQ ring lives in host memory within the combined
+		 * buffer.  Window state resets each invocation, so recompute the DPA window
+		 * pointer to the CQ ring and update cq_ring / cqe accordingly.
+		 */
+		if (ctx->hostcq_enabled) {
+			uint32_t mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
+			ctx->rq_cq_ctx.cq_ring = (struct flexio_dev_cqe64 *)(uintptr_t)
+				(combined_dpa_base + (ctx->rqcq_haddr_base - ctx->rqd_haddr_base));
+			ctx->rq_cq_ctx.cqe = &ctx->rq_cq_ctx.cq_ring[ctx->rq_cq_ctx.cq_idx & mask];
+		}
 	}
 
     uint64_t last_packet_count = ctx->packets_count;
     
     uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
-    decompress_if_cqe_is_compressed(ctx);
+    if (decompress_wrapper(ctx) == -1) goto deschedule;
 
 	/* Poll CQ until the package is received. */
 	while (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) !=
@@ -379,8 +424,9 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 			process_packet(ctx);
 		/* Update RQ CQ */
 		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
+        update_data_from_host_cq_idx(data_from_host, ctx);
 
-        decompress_if_cqe_is_compressed(ctx);
+        if (decompress_wrapper(ctx) == -1) goto deschedule;
 
         #define DOORBELL_BURST 16U
         if (ctx->packets_count - last_doorbelled_packet_count == DOORBELL_BURST) {
@@ -391,14 +437,15 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 
         if (ctx->packets_count - last_packet_count > 10000) {
             last_packet_count = ctx->packets_count;
-            update_data_from_host(data_from_host, ctx);
+            update_data_from_host_report(data_from_host, ctx);
         }
 	}
     __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
     dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - last_doorbelled_packet_count));
     last_doorbelled_packet_count = ctx->packets_count;
-    update_data_from_host(data_from_host, ctx);
+    update_data_from_host_report(data_from_host, ctx);
 
+deschedule:
 	/* Update the memory to the chip */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	/* Arming cq for next packet */
