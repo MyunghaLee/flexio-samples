@@ -527,7 +527,7 @@ static int sq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *
 	 */
 	size_t hbuf_size = t->hostcq_enable ? (2 * Q_DATA_BSIZE + CQ_BSIZE) : (2 * Q_DATA_BSIZE);
 
-	if (posix_memalign(&t->data_hbuf, 64, hbuf_size)) {
+	if (posix_memalign(&t->data_hbuf, CQ_BSIZE, hbuf_size)) {
 		printf("Failed to allocate host memory for combined data buffer\n");
 		return -1;
 	}
@@ -1508,11 +1508,11 @@ static void *hostdecomp_poll_thread(void *arg)
 
 			if ((qctx->decomp_total_mini - qctx->decomp_last_report_mini) >=
 			    HOST_DECOMP_LAT_REPORT_MINI) {
-				printf("hostdecomp latency: thread=%u avg=%llu ns/mini samples=%llu\n",
-				       qctx->thread_index,
-				       (unsigned long long)(qctx->decomp_total_ns /
-							    qctx->decomp_total_mini),
-				       (unsigned long long)qctx->decomp_total_mini);
+				// printf("hostdecomp latency: thread=%u avg=%llu ns/mini samples=%llu\n",
+				       // qctx->thread_index,
+				       // (unsigned long long)(qctx->decomp_total_ns /
+							    // qctx->decomp_total_mini),
+				       // (unsigned long long)qctx->decomp_total_mini);
 				qctx->decomp_last_report_mini = qctx->decomp_total_mini;
 			}
 
@@ -1606,10 +1606,10 @@ static int hostdecomp_stop(struct hostdecomp_ctx *ctx)
 
 		if (!qctx->enabled || !qctx->decomp_total_mini)
 			continue;
-		printf("hostdecomp final: thread=%u avg=%llu ns/mini samples=%llu\n",
-		       qctx->thread_index,
-		       (unsigned long long)(qctx->decomp_total_ns / qctx->decomp_total_mini),
-		       (unsigned long long)qctx->decomp_total_mini);
+		// printf("hostdecomp final: thread=%u avg=%llu ns/mini samples=%llu\n",
+		       // qctx->thread_index,
+		       // (unsigned long long)(qctx->decomp_total_ns / qctx->decomp_total_mini),
+		       // (unsigned long long)qctx->decomp_total_mini);
 	}
 
 	free(ctx->queues);
