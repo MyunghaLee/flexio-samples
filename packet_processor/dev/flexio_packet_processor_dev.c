@@ -235,19 +235,21 @@ static void process_packet(struct app_device_ctx *ctx)
 		rq_data = (char *)(ctx->rqd_dpa_base + (rq_haddr - ctx->rqd_haddr_base));
 
 		/* Compute host VA and DPA window pointer for the next SQ data slot. */
-		uint32_t sq_slot = ctx->dt_ctx.tx_buff_idx & DATA_IDX_MASK;
-		sq_haddr = ctx->sqd_haddr_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE);
-		sq_data = (char *)(ctx->sqd_dpa_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE));
-		ctx->dt_ctx.tx_buff_idx++;
+		// uint32_t sq_slot = ctx->dt_ctx.tx_buff_idx & DATA_IDX_MASK;
+		// sq_haddr = ctx->sqd_haddr_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE);
+		// sq_data = (char *)(ctx->sqd_dpa_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE));
+		// ctx->dt_ctx.tx_buff_idx++;
+        sq_data = rq_data;
 	} else {
 		/* DPA buffer mode: pointers are DPA heap addresses, usable directly. */
 		rq_data = flexio_dev_rwqe_get_addr(rwqe);
-		sq_data = get_next_dte(&ctx->dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+		// sq_data = get_next_dte(&ctx->dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+        sq_data = rq_data;
 		sq_haddr = 0; /* unused in DPA mode */
 	}
 
 	/* Copy received packet to sq_data as is */
-	memcpy(sq_data, rq_data, data_sz);
+	// memcpy(sq_data, rq_data, data_sz);
 
 	/* swap mac address */
 	swap_macs(sq_data);
