@@ -73,6 +73,7 @@ struct app_device_ctx {
 
 	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
 	uint8_t  hostbuf_enabled;
+	uint8_t  zerocopy_enabled;   /* 1 = forward RQ buffer directly without memcpy */
 	uint32_t window_id;          /* FlexIO window ID */
 	uint32_t rqd_mkey;           /* ibv lkey for RQ data buffer */
 	uint32_t sqd_mkey;           /* ibv lkey for SQ data buffer */
@@ -120,6 +121,7 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 
 	/* Initialize host buffer mode fields. */
 	ctx->hostbuf_enabled = data_from_host->hostbuf_enabled;
+	ctx->zerocopy_enabled = data_from_host->zerocopy_enabled;
 	if (data_from_host->hostbuf_enabled) {
 		ctx->window_id = data_from_host->window_id;
 		ctx->rqd_mkey = data_from_host->rq_transf.wqd_mkey_id;
@@ -234,22 +236,34 @@ static void process_packet(struct app_device_ctx *ctx)
 		uint64_t rq_haddr = (uint64_t)flexio_dev_rwqe_get_addr(rwqe);
 		rq_data = (char *)(ctx->rqd_dpa_base + (rq_haddr - ctx->rqd_haddr_base));
 
-		/* Compute host VA and DPA window pointer for the next SQ data slot. */
-		// uint32_t sq_slot = ctx->dt_ctx.tx_buff_idx & DATA_IDX_MASK;
-		// sq_haddr = ctx->sqd_haddr_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE);
-		// sq_data = (char *)(ctx->sqd_dpa_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE));
-		// ctx->dt_ctx.tx_buff_idx++;
-        sq_data = rq_data;
+		if (ctx->zerocopy_enabled) {
+			/* Zero-copy: send directly from the RQ buffer.
+			 * Use the RQ host VA in the WQE — both halves share one lkey. */
+			sq_data = rq_data;
+			sq_haddr = rq_haddr;
+		} else {
+			/* Normal path: copy to the next SQ data slot. */
+			uint32_t sq_slot = ctx->dt_ctx.tx_buff_idx & DATA_IDX_MASK;
+			sq_haddr = ctx->sqd_haddr_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE);
+			sq_data = (char *)(ctx->sqd_dpa_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE));
+			ctx->dt_ctx.tx_buff_idx++;
+		}
 	} else {
 		/* DPA buffer mode: pointers are DPA heap addresses, usable directly. */
 		rq_data = flexio_dev_rwqe_get_addr(rwqe);
-		// sq_data = get_next_dte(&ctx->dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
-        sq_data = rq_data;
 		sq_haddr = 0; /* unused in DPA mode */
+		if (ctx->zerocopy_enabled) {
+			/* Zero-copy: send directly from the RQ buffer. */
+			sq_data = rq_data;
+		} else {
+			/* Normal path: copy to the next SQ data slot. */
+			sq_data = get_next_dte(&ctx->dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+		}
 	}
 
-	/* Copy received packet to sq_data as is */
-	// memcpy(sq_data, rq_data, data_sz);
+	/* Copy received packet to sq_data (skipped in zero-copy mode). */
+	if (!ctx->zerocopy_enabled)
+		memcpy(sq_data, rq_data, data_sz);
 
 	/* swap mac address */
 	swap_macs(sq_data);

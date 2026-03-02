@@ -73,6 +73,7 @@ struct thread_ctx {
     uint8_t rxonly_enable;
     uint8_t cqe_comp_enable;
     uint8_t hostbuf_enable;
+    uint8_t zerocopy_enable;
 
 	/* Host buffer resources (used only when hostbuf_enable == 1) */
 	/* Combined buffer: RQ data occupies the first half, SQ data the second half.
@@ -851,8 +852,9 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	h2d_data->not_first_run = 0;
 	/* Propagate rxonly mode so the DPA thread calls the right packet handler. */
 	h2d_data->rxonly_enabled = t->rxonly_enable;
-	/* Propagate host-buffer mode and window ID to DPA. */
+	/* Propagate host-buffer mode, window ID, and zero-copy mode to DPA. */
 	h2d_data->hostbuf_enabled = t->hostbuf_enable;
+	h2d_data->zerocopy_enabled = t->zerocopy_enable;
 	h2d_data->window_id = app_ctx->window ? flexio_window_get_id(app_ctx->window) : 0;
 
 	/* Copy to DPA heap memory.
@@ -1193,6 +1195,8 @@ int main(int argc, char **argv)
 	int cqe_comp_enable = 0;
 	/* Host buffer mode: packet data buffers allocated in host memory instead of DPA heap. */
 	int hostbuf_enable = 0;
+	/* Zero-copy mode: forward RQ buffer directly to TX without memcpy. */
+	int zerocopy_enable = 0;
 	/* Loop index */
 	int i;
 	/* Buffer for fread */
@@ -1204,7 +1208,7 @@ int main(int argc, char **argv)
 
 	/* Check input includes at least a device name. */
 	if (argc < 2) {
-		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off]\n",
+		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off]\n",
 		       argv[0]);
 		return -1;
 	}
@@ -1271,9 +1275,23 @@ int main(int argc, char **argv)
 				return -1;
 			}
 			i += 2;
+		} else if (!strcmp(argv[i], "--zerocopy")) {
+			if (i + 1 >= argc) {
+				printf("--zerocopy requires 'on' or 'off'\n");
+				return -1;
+			}
+			if (!strcmp(argv[i + 1], "on")) {
+				zerocopy_enable = 1;
+			} else if (!strcmp(argv[i + 1], "off")) {
+				zerocopy_enable = 0;
+			} else {
+				printf("--zerocopy value must be 'on' or 'off'\n");
+				return -1;
+			}
+			i += 2;
 		} else {
 			printf("Unknown argument: %s\n", argv[i]);
-			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off]\n",
+			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off]\n",
 			       argv[0]);
 			return -1;
 		}
@@ -1403,6 +1421,7 @@ int main(int argc, char **argv)
 		t->rxonly_enable = (uint8_t)rxonly_enable;
 		t->cqe_comp_enable = (uint8_t)cqe_comp_enable;
 		t->hostbuf_enable = (uint8_t)hostbuf_enable;
+		t->zerocopy_enable = (uint8_t)zerocopy_enable;
 
 		/* Create an event handler pinned to EU i (FLEXIO_AFFINITY_STRICT). */
 		if (create_thread_event_handler(&app_ctx, t)) {
