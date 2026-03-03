@@ -218,6 +218,7 @@ static int decompress_wrapper(struct app_device_ctx *ctx) {
 
     if (ctx->hostcq_enabled) __dpa_thread_window_writeback();
 
+    // if (ret == -1 & ctx->thread_index == 0) flexio_dev_print("oh no!\n");
     return ret;
 }
 
@@ -407,6 +408,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     
     uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
+// deschedule:
     if (decompress_wrapper(ctx) == -1) goto deschedule;
 
 	/* Poll CQ until the package is received. */
@@ -426,7 +428,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
         update_data_from_host_cq_idx(data_from_host, ctx);
 
-        if (decompress_wrapper(ctx) == -1) goto deschedule;
 
         #define DOORBELL_BURST 16U
         if (ctx->packets_count - last_doorbelled_packet_count == DOORBELL_BURST) {
@@ -439,6 +440,8 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
             last_packet_count = ctx->packets_count;
             update_data_from_host_report(data_from_host, ctx);
         }
+
+        if (decompress_wrapper(ctx) == -1) goto deschedule;
 	}
     __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
     dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - last_doorbelled_packet_count));
