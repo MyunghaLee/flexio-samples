@@ -72,7 +72,7 @@
 /* Flex IO SDK host side API header. */
 #include <libflexio/flexio.h>
 
-#include <immintrin.h>
+// #include <immintrin.h>
 
 /* Flow steering utilities helper header. */
 #include "flow_steering_utils.h"
@@ -1328,15 +1328,15 @@ static int system_prompt(struct app_context *app_ctx)
 				printf("Compress percentage: N/A (no packets received)\n");
 		} else if (cmd == 99) {
             // wait for 5 seconds
-            struct timespec start, now;
-            clock_gettime(CLOCK_MONOTONIC, &start);
-            long end_sec = start.tv_sec + 5;
-            long end_nsec = start.tv_nsec;
-            while (1) {
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                if (now.tv_sec > end_sec || (now.tv_sec == end_sec && now.tv_nsec >= end_nsec)) break;
-                _mm_pause();
-            }
+            // struct timespec start, now;
+            // clock_gettime(CLOCK_MONOTONIC, &start);
+            // long end_sec = start.tv_sec + 5;
+            // long end_nsec = start.tv_nsec;
+            // while (1) {
+                // clock_gettime(CLOCK_MONOTONIC, &now);
+                // if (now.tv_sec > end_sec || (now.tv_sec == end_sec && now.tv_nsec >= end_nsec)) break;
+                // _mm_pause();
+            // }
         }
 		/* else: ignore unrecognized input */
 	}
