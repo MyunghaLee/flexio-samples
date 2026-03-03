@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <sched.h>
 /*
  * SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES.
  * Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -69,6 +71,8 @@
 
 /* Flex IO SDK host side API header. */
 #include <libflexio/flexio.h>
+
+#include <immintrin.h>
 
 /* Flow steering utilities helper header. */
 #include "flow_steering_utils.h"
@@ -1283,7 +1287,7 @@ static int system_prompt(struct app_context *app_ctx)
 
 			for (i = 0; i < n; i++)
 				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
-			sleep(1);
+			usleep(500000);
 			for (i = 0; i < n; i++) {
 				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_after[i]);
 				if (snap_after[i].heartbeat != snap_before[i].heartbeat)
@@ -1296,20 +1300,20 @@ static int system_prompt(struct app_context *app_ctx)
 
 			for (i = 0; i < n; i++)
 				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
-			sleep(1);
+			usleep(500000);
 			for (i = 0; i < n; i++) {
 				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_after[i]);
 				total_pps += snap_after[i].report_packets_count -
 					     snap_before[i].report_packets_count;
 			}
-			printf("Throughput: %.3f Mpps\n", (double)total_pps / 1e6);
+			printf("Throughput: %.3f Mpps\n", (double)total_pps / 1e6 * 2);
 		} else if (cmd == 3) {
 			/* Measure comp_packets / packets over 1 second. display as percentage */
 			uint64_t total_pkts = 0, total_comp = 0;
 
 			for (i = 0; i < n; i++)
 				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
-			sleep(1);
+			usleep(500000);
 			for (i = 0; i < n; i++) {
 				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_after[i]);
 				total_pkts += snap_after[i].report_packets_count -
@@ -1322,7 +1326,18 @@ static int system_prompt(struct app_context *app_ctx)
 				       (double)total_comp / (double)total_pkts * 100.0);
 			else
 				printf("Compress percentage: N/A (no packets received)\n");
-		}
+		} else if (cmd == 99) {
+            // wait for 5 seconds
+            struct timespec start, now;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            long end_sec = start.tv_sec + 5;
+            long end_nsec = start.tv_nsec;
+            while (1) {
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec > end_sec || (now.tv_sec == end_sec && now.tv_nsec >= end_nsec)) break;
+                _mm_pause();
+            }
+        }
 		/* else: ignore unrecognized input */
 	}
 
@@ -1448,6 +1463,16 @@ static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
  */
 static void *hostdecomp_poll_thread(void *arg)
 {
+    int core_num = 15;
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset); 
+    CPU_SET(core_num, &cpuset);
+    pthread_t current_thread = pthread_self();
+    int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    if (result != 0) {
+        perror("pthread_setaffinity_np failed");
+    } 
+
 	struct hostdecomp_ctx *ctx = arg;
 	struct host_cqe64 first = {0}, second = {0};
 	uint32_t mini_cqe_num;
