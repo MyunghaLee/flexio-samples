@@ -86,10 +86,9 @@ struct app_device_ctx {
 	uint32_t window_id;          /* FlexIO window ID */
 
 	uint8_t  hostbuf_enabled;
-	uint8_t  zerocopy_enabled;   /* 1 = forward RQ buffer directly without memcpy */
     uint8_t  hostcq_enabled;
     uint8_t  hostdecomp_enabled;
-    uint8_t rsvd[32];
+    uint8_t rsvd[33];
 
 } __attribute__((__packed__, aligned(64)));
 
@@ -130,7 +129,6 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 
 	/* Initialize host buffer mode fields. */
 	ctx->hostbuf_enabled = data_from_host->hostbuf_enabled;
-	ctx->zerocopy_enabled = data_from_host->zerocopy_enabled;
 	ctx->hostcq_enabled = data_from_host->hostcq_enabled;
 	ctx->hostdecomp_enabled = data_from_host->hostdecomp_enabled;
 	if (data_from_host->hostbuf_enabled) {
@@ -180,7 +178,9 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 	com_dt_ctx_init(&ctx->dt_ctx, data_from_host->sq_transf.wqd_daddr);
 }
 
+#if CQE_COMP==1
 static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
+	__dpa_thread_fence(__DPA_MEMORY, __DPA_RW, __DPA_RW);
     if (!flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
         return;
     }
@@ -213,10 +213,11 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
 
     ctx->comp_packets_count += mini_cqe_num;
 }
+#endif
 
+#if CQE_COMP==1
 static int decompress_wrapper(struct app_device_ctx *ctx) {
     int ret = 0;
-    (void) ctx;
 
     if (ctx->hostcq_enabled) __dpa_thread_window_read_inv();
 
@@ -227,18 +228,14 @@ static int decompress_wrapper(struct app_device_ctx *ctx) {
 
     return ret;
 }
+#endif
 
-
-static void rxonly_packet(struct app_device_ctx *ctx)
-{
-    /* just do nothing is fine */
-    (void) ctx;
-}
 
 
 /* process packet - read it, swap MAC addresses, modify it, create a send WQE and send it back.
  *  ctx - pointer to the per-thread app_device_ctx.
  */
+#ifndef RXONLY
 static void process_packet(struct app_device_ctx *ctx)
 {
 	/* RX packet handling variables */
@@ -270,34 +267,33 @@ static void process_packet(struct app_device_ctx *ctx)
 		uint64_t rq_haddr = (uint64_t)flexio_dev_rwqe_get_addr(rwqe);
 		rq_data = (char *)(ctx->rqd_dpa_base + (rq_haddr - ctx->rqd_haddr_base));
 
-		if (ctx->zerocopy_enabled) {
-			/* Zero-copy: send directly from the RQ buffer.
-			 * Use the RQ host VA in the WQE — both halves share one lkey. */
+        #ifdef ZEROCOPY
 			sq_data = rq_data;
 			sq_haddr = rq_haddr;
-		} else {
+        #else
 			/* Normal path: copy to the next SQ data slot. */
 			uint32_t sq_slot = ctx->dt_ctx.tx_buff_idx & DATA_IDX_MASK;
 			sq_haddr = ctx->sqd_haddr_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE);
 			sq_data = (char *)(ctx->sqd_dpa_base + ((uint64_t)sq_slot << LOG_WQD_CHUNK_BSIZE));
 			ctx->dt_ctx.tx_buff_idx++;
-		}
+        #endif
 	} else {
 		/* DPA buffer mode: pointers are DPA heap addresses, usable directly. */
 		rq_data = flexio_dev_rwqe_get_addr(rwqe);
 		sq_haddr = 0; /* unused in DPA mode */
-		if (ctx->zerocopy_enabled) {
+        #ifdef ZEROCOPY
 			/* Zero-copy: send directly from the RQ buffer. */
 			sq_data = rq_data;
-		} else {
+        #else
 			/* Normal path: copy to the next SQ data slot. */
 			sq_data = get_next_dte(&ctx->dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
-		}
+        #endif
 	}
 
 	/* Copy received packet to sq_data (skipped in zero-copy mode). */
-	if (!ctx->zerocopy_enabled)
+    #ifndef ZEROCOPY
 		memcpy(sq_data, rq_data, data_sz);
+    #endif
 
 	/* swap mac address */
 	swap_macs(sq_data);
@@ -342,6 +338,7 @@ static void process_packet(struct app_device_ctx *ctx)
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	flexio_dev_qp_sq_ring_db(++ctx->sq_ctx.sq_pi, ctx->sq_ctx.sq_number);
 }
+#endif
 
 static void update_data_from_host_report(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
     data_from_host->report_packets_count = ctx->packets_count;
@@ -414,21 +411,22 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     
     uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
-    if (decompress_wrapper(ctx) == -1) goto deschedule;
+    #if CQE_COMP==1
+    if (unlikely(decompress_wrapper(ctx) == -1)) goto deschedule;
+    // decompress_if_cqe_is_compressed(ctx);
+    #endif
 
 	/* Poll CQ until the package is received. */
-	while (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) !=
-	       ctx->rq_cq_ctx.cq_hw_owner_bit) {
+	while (likely(flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) != ctx->rq_cq_ctx.cq_hw_owner_bit)) {
 		/* Print the message */
 		// flexio_dev_print("Process packet: %ld\n", ctx->packets_count++);
         ctx->packets_count++;
 		/* Update memory to DPA */
 		__dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
 		/* Process or drop the packet based on rxonly mode. */
-		if (data_from_host->rxonly_enabled)
-			rxonly_packet(ctx);
-		else
+        #ifndef RXONLY
 			process_packet(ctx);
+        #endif
 		/* Update RQ CQ */
 		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
         update_data_from_host_cq_idx(data_from_host, ctx);
@@ -439,19 +437,24 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
             last_doorbelled_packet_count = ctx->packets_count;
         }
 
-        if (ctx->packets_count - last_packet_count > 10000) {
+        if (unlikely(ctx->packets_count - last_packet_count > 10000)) {
             last_packet_count = ctx->packets_count;
             update_data_from_host_report(data_from_host, ctx);
         }
 
-        if (decompress_wrapper(ctx) == -1) goto deschedule;
+        #if CQE_COMP==1
+        if (unlikely(decompress_wrapper(ctx) == -1)) goto deschedule;
+        // decompress_if_cqe_is_compressed(ctx);
+        #endif
 	}
     __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
     dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - last_doorbelled_packet_count));
     last_doorbelled_packet_count = ctx->packets_count;
     update_data_from_host_report(data_from_host, ctx);
 
+#if CQE_COMP==1
 deschedule:
+#endif
 	/* Update the memory to the chip */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	/* Arming cq for next packet */

@@ -129,13 +129,10 @@ struct thread_ctx {
 	flexio_uintptr_t app_data_daddr;
 
 	uint32_t thread_index;
-    uint8_t rxonly_enable;
-    uint8_t cqe_comp_enable;
+    uint8_t rsvd[5];
     uint8_t hostbuf_enable;
-    uint8_t zerocopy_enable;
     uint8_t hostcq_enable;      /* 1 = RQ CQ ring in host memory (same window as data bufs) */
     uint8_t hostdecomp_enable;  /* 1 = host observer decompresses CQEs for this thread */
-    uint8_t rsvd[6];
 
 }  __attribute__((__packed__, aligned(64))) ;
 
@@ -858,7 +855,11 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 		rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
 	}
 
-	rqcq_attr.cqe_comp_type = t->cqe_comp_enable ? FLEXIO_CQE_COMP_ENABLE : FLEXIO_CQE_COMP_NONE;
+    #if CQE_COMP==0
+        rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_NONE;
+    #else
+        rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_ENABLE;
+    #endif
 	/* Create CQ for RQ. */
 	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
@@ -1006,11 +1007,8 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	h2d_data->thread_index = t->thread_index;
 	/* Set APP data info for first run. */
 	h2d_data->not_first_run = 0;
-	/* Propagate rxonly mode so the DPA thread calls the right packet handler. */
-	h2d_data->rxonly_enabled = t->rxonly_enable;
 	/* Propagate host-buffer mode, window ID, zero-copy, hostcq, and hostdecomp to DPA. */
 	h2d_data->hostbuf_enabled = t->hostbuf_enable;
-	h2d_data->zerocopy_enabled = t->zerocopy_enable;
 	h2d_data->hostcq_enabled = t->hostcq_enable;
 	h2d_data->hostdecomp_enabled = t->hostdecomp_enable;
 	h2d_data->window_id = app_ctx->window ? flexio_window_get_id(app_ctx->window) : 0;
@@ -1674,14 +1672,8 @@ int main(int argc, char **argv)
 	int nic_mode = 0;
 	/* Number of DPA threads to create (default 1 for backward compatibility) */
 	uint32_t num_threads = 1;
-	/* RX-only mode: DPA threads consume packets without sending them back. */
-	int rxonly_enable = 0;
-	/* CQE compression: enable hardware CQE compression on the RQ CQ. */
-	int cqe_comp_enable = 0;
 	/* Host buffer mode: packet data buffers allocated in host memory instead of DPA heap. */
 	int hostbuf_enable = 0;
-	/* Zero-copy mode: forward RQ buffer directly to TX without memcpy. */
-	int zerocopy_enable = 0;
 	/* Host CQ mode: RQ CQ ring placed in host memory (same window as data buffers). */
 	int hostcq_enable = 0;
 	/* Host decomp mode: host observer thread decompresses CQEs for DPA threads. */
@@ -1699,7 +1691,7 @@ int main(int argc, char **argv)
 
 	/* Check input includes at least a device name. */
 	if (argc < 2) {
-		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
+		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--hostbuf on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
 		       argv[0]);
 		return -1;
 	}
@@ -1724,34 +1716,6 @@ int main(int argc, char **argv)
 			}
 			num_threads = (uint32_t)val;
 			i += 2;
-		} else if (!strcmp(argv[i], "--rxonly")) {
-			if (i + 1 >= argc) {
-				printf("--rxonly requires 'on' or 'off'\n");
-				return -1;
-			}
-			if (!strcmp(argv[i + 1], "on")) {
-				rxonly_enable = 1;
-			} else if (!strcmp(argv[i + 1], "off")) {
-				rxonly_enable = 0;
-			} else {
-				printf("--rxonly value must be 'on' or 'off'\n");
-				return -1;
-			}
-			i += 2;
-		} else if (!strcmp(argv[i], "--cqe_comp")) {
-			if (i + 1 >= argc) {
-				printf("--cqe_comp requires 'on' or 'off'\n");
-				return -1;
-			}
-			if (!strcmp(argv[i + 1], "on")) {
-				cqe_comp_enable = 1;
-			} else if (!strcmp(argv[i + 1], "off")) {
-				cqe_comp_enable = 0;
-			} else {
-				printf("--cqe_comp value must be 'on' or 'off'\n");
-				return -1;
-			}
-			i += 2;
 		} else if (!strcmp(argv[i], "--hostbuf")) {
 			if (i + 1 >= argc) {
 				printf("--hostbuf requires 'on' or 'off'\n");
@@ -1763,20 +1727,6 @@ int main(int argc, char **argv)
 				hostbuf_enable = 0;
 			} else {
 				printf("--hostbuf value must be 'on' or 'off'\n");
-				return -1;
-			}
-			i += 2;
-		} else if (!strcmp(argv[i], "--zerocopy")) {
-			if (i + 1 >= argc) {
-				printf("--zerocopy requires 'on' or 'off'\n");
-				return -1;
-			}
-			if (!strcmp(argv[i + 1], "on")) {
-				zerocopy_enable = 1;
-			} else if (!strcmp(argv[i + 1], "off")) {
-				zerocopy_enable = 0;
-			} else {
-				printf("--zerocopy value must be 'on' or 'off'\n");
 				return -1;
 			}
 			i += 2;
@@ -1810,7 +1760,7 @@ int main(int argc, char **argv)
 			i += 2;
 		} else {
 			printf("Unknown argument: %s\n", argv[i]);
-			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--rxonly on|off] [--cqe_comp on|off] [--hostbuf on|off] [--zerocopy on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
+			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--hostbuf on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
 			       argv[0]);
 			return -1;
 		}
@@ -1948,10 +1898,7 @@ int main(int argc, char **argv)
 		struct thread_ctx *t = &app_ctx.threads[i];
 
 		t->thread_index    = (uint32_t)i;
-		t->rxonly_enable   = (uint8_t)rxonly_enable;
-		t->cqe_comp_enable = (uint8_t)cqe_comp_enable;
 		t->hostbuf_enable  = (uint8_t)hostbuf_enable;
-		t->zerocopy_enable = (uint8_t)zerocopy_enable;
 		t->hostcq_enable   = (uint8_t)hostcq_enable;
 		t->hostdecomp_enable = (uint8_t)hostdecomp_enable;
 
