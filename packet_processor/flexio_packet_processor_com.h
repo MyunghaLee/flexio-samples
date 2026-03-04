@@ -36,13 +36,14 @@
 #define __FLEXIO_PACKET_PROCESSOR_COM_H__
 
 #include <stdint.h>
+#include "./exp_cond.h"
 
 /* Depth of CQ is (1 << LOG_CQ_DEPTH) */
-#define LOG_CQ_DEPTH 7
+#define LOG_CQ_DEPTH LOG_QUEUE_SIZE
 /* Depth of RQ is (1 << LOG_RQ_DEPTH) */
-#define LOG_RQ_DEPTH 7
+#define LOG_RQ_DEPTH LOG_QUEUE_SIZE
 /* Depth of SQ is (1 << LOG_SQ_DEPTH) */
-#define LOG_SQ_DEPTH 7
+#define LOG_SQ_DEPTH LOG_QUEUE_SIZE
 
 /* Size of WQD is (1 << LOG_WQD_CHUNK_BSIZE) */
 #define LOG_WQD_CHUNK_BSIZE 11

@@ -1,0 +1,9 @@
+#define DOORBELL_BURST 12
+#define LOG_QUEUE_SIZE 7
+
+/* 0 - OFF, 1 - DPA_DECOMP, 2 - HOST_DECOMP */
+#define CQE_COMP 0
+
+#define RXONLY
+#define HOSTBUF
+#define HOSTCQ

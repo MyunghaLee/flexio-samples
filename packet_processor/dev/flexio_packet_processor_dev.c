@@ -66,6 +66,7 @@ struct app_device_ctx {
 	uint64_t rqd_haddr_base;     /* host VA base of RQ data buffer */
 	uint64_t sqd_haddr_base;     /* host VA base of SQ data buffer */
 	uint64_t rqcq_haddr_base;        /* host VA of RQ CQ ring (hostcq mode) */
+
 	/* Per-invocation DPA window pointers (set at start of each handler call) */
 	flexio_uintptr_t rqd_dpa_base;
 	flexio_uintptr_t sqd_dpa_base;
@@ -180,11 +181,9 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 }
 
 static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
-// start:
     if (!flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
         return;
     }
-    // flexio_dev_print("nono\n");
 
     struct flexio_dev_cqe64 *mini_cqe_block = ctx->rq_cq_ctx.cqe;
 	uint32_t cq_idx_mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
@@ -203,21 +202,16 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
         current_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx + i) & CQ_IDX_MASK];
         current_own_bit = ((ctx->rq_cq_ctx.cq_idx + i) & CQ_IDX_MASK) ? current_own_bit : !current_own_bit;
         
-        // memcpy(current_cqe, title_cqe, 64);
+        memcpy(current_cqe, title_cqe, 64);
 
-        // current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
-        // current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
-        // current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i + 1U);
+        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
+        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
+        current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i + 1U);
 
         current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-        // current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
     }
 
     ctx->comp_packets_count += mini_cqe_num;
-
-    // ctx->packets_count += mini_cqe_num;
-    // for (uint32_t i = 0; i < mini_cqe_num; i++) com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
-    // goto start;
 }
 
 static int decompress_wrapper(struct app_device_ctx *ctx) {
@@ -439,7 +433,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
         update_data_from_host_cq_idx(data_from_host, ctx);
 
-        #define DOORBELL_BURST 12U
         if (ctx->packets_count - last_doorbelled_packet_count >= DOORBELL_BURST) {
             __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
             dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, ctx->packets_count - last_doorbelled_packet_count);

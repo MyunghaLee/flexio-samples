@@ -282,7 +282,7 @@ cleanup:
 /* Convert logarithm to value. */
 #define L2V(l) (1UL << (l))
 /* Number of entries in each RQ/SQ/CQ is 2^LOG_Q_DEPTH. */
-#define LOG_Q_DEPTH 7
+#define LOG_Q_DEPTH LOG_QUEUE_SIZE
 #define Q_DEPTH L2V(LOG_Q_DEPTH)
 /* SQ/RQ data entry byte size is 512B (enough for packet data in this case). */
 #define LOG_Q_DATA_ENTRY_BSIZE 11
