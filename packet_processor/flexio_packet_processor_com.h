@@ -87,7 +87,7 @@ struct host2dev_packet_processor_data {
 	/* SQ transfer information. */
 	struct app_transfer_wq sq_transf;
     uint64_t report_packets_count;
-    uint64_t report_comp_packets_count;
+    uint64_t report_comp_packets_count; // until here 128B
 	uint32_t thread_index;   /* Index into device-side app_ctxs[] */
     uint32_t dpa_current_cq_idx; /* used for host's CQE decompression */
     uint16_t heartbeat;
@@ -98,6 +98,7 @@ struct host2dev_packet_processor_data {
 	uint8_t  zerocopy_enabled; /* 1 = forward RQ buffer directly without memcpy */
     uint8_t  hostcq_enabled; /* 1 = CQ locates in host memory */
     uint8_t  hostdecomp_enabled; /* 1 = host does the CQE decompression */
-} __attribute__((__packed__, aligned(8)));
+    uint8_t  rsvd[44];
+} __attribute__((__packed__, aligned(64)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */

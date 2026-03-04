@@ -57,35 +57,40 @@
 
 /* Per-thread DPA application context. Indexed by thread_index. */
 struct app_device_ctx {
-	/* Packet count - used for debug message */
-	uint64_t  packets_count;
-	uint64_t  comp_packets_count;
-	/* lkey - local memory key (DPA flexio mkey or ibv lkey depending on mode) */
-	uint32_t  lkey;
-	/* Thread index - mirrors host-side assignment */
-	uint32_t  thread_index;
+	cq_ctx_t  rq_cq_ctx;    /* RQ CQ */ //40B
+	rq_ctx_t  rq_ctx;       /* RQ */ //24B
+	sq_ctx_t  sq_ctx;       /* SQ */ //24B
+	cq_ctx_t  sq_cq_ctx;    /* SQ CQ */ //40B
+	dt_ctx_t  dt_ctx;       /* SQ Data ring */ //16B
 
-	cq_ctx_t  rq_cq_ctx;    /* RQ CQ */
-	rq_ctx_t  rq_ctx;       /* RQ */
-	sq_ctx_t  sq_ctx;       /* SQ */
-	cq_ctx_t  sq_cq_ctx;    /* SQ CQ */
-	dt_ctx_t  dt_ctx;       /* SQ Data ring */
-
-	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
-	uint8_t  hostbuf_enabled;
-	uint8_t  zerocopy_enabled;   /* 1 = forward RQ buffer directly without memcpy */
-    uint8_t  hostcq_enabled;
-    uint8_t  hostdecomp_enabled;
-	uint32_t window_id;          /* FlexIO window ID */
-	uint32_t rqd_mkey;           /* ibv lkey for RQ data buffer */
-	uint32_t sqd_mkey;           /* ibv lkey for SQ data buffer */
 	uint64_t rqd_haddr_base;     /* host VA base of RQ data buffer */
 	uint64_t sqd_haddr_base;     /* host VA base of SQ data buffer */
 	uint64_t rqcq_haddr_base;        /* host VA of RQ CQ ring (hostcq mode) */
 	/* Per-invocation DPA window pointers (set at start of each handler call) */
 	flexio_uintptr_t rqd_dpa_base;
 	flexio_uintptr_t sqd_dpa_base;
-};
+
+	uint32_t rqd_mkey;           /* ibv lkey for RQ data buffer */
+	uint32_t sqd_mkey;           /* ibv lkey for SQ data buffer */ // here, 192B
+
+	uint64_t  packets_count; 
+	uint64_t  comp_packets_count;
+
+	/* lkey - local memory key (DPA flexio mkey or ibv lkey depending on mode) */
+	uint32_t  lkey;
+	/* Thread index - mirrors host-side assignment */
+	uint32_t  thread_index;
+
+	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
+	uint32_t window_id;          /* FlexIO window ID */
+
+	uint8_t  hostbuf_enabled;
+	uint8_t  zerocopy_enabled;   /* 1 = forward RQ buffer directly without memcpy */
+    uint8_t  hostcq_enabled;
+    uint8_t  hostdecomp_enabled;
+    uint8_t rsvd[32];
+
+} __attribute__((__packed__, aligned(64)));
 
 /* Static array of per-thread contexts. Each event handler is pinned to a dedicated EU,
  * so EU i only ever accesses app_ctxs[i] — no locking required.
@@ -175,9 +180,11 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 }
 
 static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
+// start:
     if (!flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
         return;
     }
+    // flexio_dev_print("nono\n");
 
     struct flexio_dev_cqe64 *mini_cqe_block = ctx->rq_cq_ctx.cqe;
 	uint32_t cq_idx_mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
@@ -196,20 +203,26 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
         current_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx + i) & CQ_IDX_MASK];
         current_own_bit = ((ctx->rq_cq_ctx.cq_idx + i) & CQ_IDX_MASK) ? current_own_bit : !current_own_bit;
         
-        memcpy(current_cqe, title_cqe, 64);
+        // memcpy(current_cqe, title_cqe, 64);
 
-        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
-        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i + 1U);
+        // current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
+        // current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
+        // current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i + 1U);
 
-        current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+        // current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
     }
 
     ctx->comp_packets_count += mini_cqe_num;
+
+    // ctx->packets_count += mini_cqe_num;
+    // for (uint32_t i = 0; i < mini_cqe_num; i++) com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
+    // goto start;
 }
 
 static int decompress_wrapper(struct app_device_ctx *ctx) {
     int ret = 0;
+    (void) ctx;
 
     if (ctx->hostcq_enabled) __dpa_thread_window_read_inv();
 
@@ -427,9 +440,9 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         update_data_from_host_cq_idx(data_from_host, ctx);
 
         #define DOORBELL_BURST 12U
-        if (ctx->packets_count - last_doorbelled_packet_count == DOORBELL_BURST) {
+        if (ctx->packets_count - last_doorbelled_packet_count >= DOORBELL_BURST) {
             __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
-            dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, DOORBELL_BURST);
+            dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, ctx->packets_count - last_doorbelled_packet_count);
             last_doorbelled_packet_count = ctx->packets_count;
         }
 

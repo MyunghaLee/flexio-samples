@@ -15,7 +15,8 @@
                 "__DPA_W=0",
                 "__DPA_R=0",
                 "__DPA_RW=0",
-                "CLOCK_MONOTONIC=1"
+                "CLOCK_MONOTONIC=1",
+                "FLEXIO_DEV_ALWAYS_INLINE="
             ],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "gnu17",

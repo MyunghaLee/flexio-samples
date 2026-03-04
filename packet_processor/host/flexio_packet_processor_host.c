@@ -85,13 +85,11 @@ extern flexio_func_t flexio_pp_dev;
 
 /* Per-thread resources: one event handler, one SQ/RQ pair, one set of steering rules. */
 struct thread_ctx {
-	uint32_t thread_index;
-    uint8_t rxonly_enable;
-    uint8_t cqe_comp_enable;
-    uint8_t hostbuf_enable;
-    uint8_t zerocopy_enable;
-    uint8_t hostcq_enable;      /* 1 = RQ CQ ring in host memory (same window as data bufs) */
-    uint8_t hostdecomp_enable;  /* 1 = host observer decompresses CQEs for this thread */
+	/* Transfer descriptors */
+	struct app_transfer_cq sq_cq_transf;
+	struct app_transfer_wq sq_transf;
+	struct app_transfer_cq rq_cq_transf;
+	struct app_transfer_wq rq_transf;
 
 	/* Host buffer resources (used only when hostbuf_enable == 1).
 	 * Combined buffer layout:
@@ -100,7 +98,7 @@ struct thread_ctx {
 	 * allowing the DPA to access all via a single FlexIO window entity (ENTITY_0).
 	 */
 	void          *data_hbuf; /* combined host buffer */
-	struct ibv_mr *data_mr;   /* single MR covering the combined buffer */
+	struct ibv_mr *data_mr;   /* single MR covering the combined buffer */ //until here, 128B
 
 	/* DEVX UMEM registration for the RQ CQ ring portion of the combined buffer.
 	 * Needed for flexio_cq_create with FLEXIO_MEMTYPE_HOST qmem (hostcq mode only).
@@ -118,13 +116,7 @@ struct thread_ctx {
 	/* RQ resources */
 	struct flexio_cq   *flexio_rq_cq_ptr;
 	struct flexio_rq   *flexio_rq_ptr;
-	struct flexio_mkey *rqd_mkey;
-
-	/* Transfer descriptors */
-	struct app_transfer_cq sq_cq_transf;
-	struct app_transfer_wq sq_transf;
-	struct app_transfer_cq rq_cq_transf;
-	struct app_transfer_wq rq_transf;
+	struct flexio_mkey *rqd_mkey; // 256B
 
 	/* Flow steering (per-thread matcher + rule) */
 	struct flow_matcher *rx_matcher;
@@ -135,7 +127,17 @@ struct thread_ctx {
 
 	/* DPA heap address of this thread's host2dev descriptor */
 	flexio_uintptr_t app_data_daddr;
-};
+
+	uint32_t thread_index;
+    uint8_t rxonly_enable;
+    uint8_t cqe_comp_enable;
+    uint8_t hostbuf_enable;
+    uint8_t zerocopy_enable;
+    uint8_t hostcq_enable;      /* 1 = RQ CQ ring in host memory (same window as data bufs) */
+    uint8_t hostdecomp_enable;  /* 1 = host observer decompresses CQEs for this thread */
+    uint8_t rsvd[6];
+
+}  __attribute__((__packed__, aligned(64))) ;
 
 /* Application context struct holding necessary host side variables. */
 struct app_context {

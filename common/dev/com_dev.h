@@ -59,33 +59,36 @@
  * Contains all data needed to DPA to work with CQ.
  */
 typedef struct {
-	uint32_t cq_number;
 	struct flexio_dev_cqe64 *cq_ring, *cqe;
-	uint32_t cq_idx;
-	uint8_t cq_hw_owner_bit;
 	uint32_t *cq_dbr;
+	uint32_t cq_number;
+	uint32_t cq_idx;
 	uint32_t log_cq_depth;
-} cq_ctx_t;
+	uint8_t cq_hw_owner_bit;
+    uint8_t rsvd[3];
+} __attribute__((__packed__, aligned(8))) cq_ctx_t;
 
 /* Sample DPA RQ metadata structure.
  * Contains all data needed to DPA to work with RQ.
  */
 typedef struct {
-	uint32_t rq_number;
 	struct flexio_dev_wqe_rcv_data_seg *rq_ring;
 	uint32_t *rq_dbr;
+	uint32_t rq_number;
     uint8_t first_doorbelled;
-} rq_ctx_t;
+    uint8_t rsvd[3];
+} __attribute__((__packed__, aligned(8))) rq_ctx_t;
 
 /* Sample DPA SQ metadata structure.
  * Contains all data needed to DPA to work with SQ.
  */
 typedef struct {
-	uint32_t sq_number;
 	union flexio_dev_sqe_seg *sq_ring;
+	uint32_t sq_number;
 	uint32_t sq_wqe_seg_idx;
 	uint32_t sq_pi;
-} sq_ctx_t;
+    uint8_t rsvd[4];
+} __attribute__((__packed__, aligned(8))) sq_ctx_t;
 
 /* Sample DPA send metadata structure.
  * Contains SQ ring and data buffer for sending.
@@ -93,7 +96,8 @@ typedef struct {
 typedef struct {
 	void *sq_tx_buff;
 	uint32_t tx_buff_idx;
-} dt_ctx_t;
+    uint8_t rsvd[4];
+} __attribute__((__packed__, aligned(8)))  dt_ctx_t;
 
 /* Sample DPA EQ metadata structure.
  * Contains all data needed to DPA to work with EQ.
@@ -103,7 +107,8 @@ typedef struct {
 	struct flexio_dev_eqe *eq_ring, *eqe;
 	uint32_t eq_idx;
 	uint8_t eq_hw_owner_bit;
-} eq_ctx_t;
+    uint8_t rsvd[7];
+} __attribute__((__packed__, aligned(8)))  eq_ctx_t;
 
 /* Fill the cq_ctx_t structure with input parameters
  *  cq_ctx - structure to be filled
