@@ -410,10 +410,21 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     uint64_t last_packet_count = ctx->packets_count;
     
     uint64_t last_doorbelled_packet_count = ctx->packets_count;
-
     #if CQE_COMP==1
+    fuck:
     if (unlikely(decompress_wrapper(ctx) == -1)) goto deschedule;
     // decompress_if_cqe_is_compressed(ctx);
+    if (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) == ctx->rq_cq_ctx.cq_hw_owner_bit
+        && !flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
+            #define cq_ctx (&ctx->rq_cq_ctx)
+            /* check for wrap around */
+            if (!(cq_ctx->cq_idx & CQ_IDX_MASK))
+                cq_ctx->cq_hw_owner_bit = !cq_ctx->cq_hw_owner_bit;
+            cq_ctx->cq_idx--;
+            cq_ctx->cqe = &cq_ctx->cq_ring[cq_ctx->cq_idx & CQ_IDX_MASK];
+            #undef cq_ctx
+            goto fuck;
+        }
     #endif
 
 	/* Poll CQ until the package is received. */
