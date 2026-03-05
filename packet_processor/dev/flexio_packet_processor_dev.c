@@ -85,10 +85,11 @@ struct app_device_ctx {
 	/* Per-invocation DPA window pointers (set at start of each handler call) */
 	flexio_uintptr_t rqd_dpa_base;
 	flexio_uintptr_t sqd_dpa_base;
-    uint32_t test;
-    struct flexio_dev_cqe64 *last_decomped_cqe;
-    struct flexio_dev_cqe64 *checked_cq[8];
     uint64_t last_doorbelled_packet_count;
+    struct flexio_dev_cqe64 *while_out_cqe;
+    uint8_t while_out_opown;
+    uint32_t test;
+    // struct flexio_dev_cqe64 *checked_cq[8];
 };
 
 /* Static array of per-thread contexts. Each event handler is pinned to a dedicated EU,
@@ -235,7 +236,7 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
     if (!flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
         return;
     }
-    ctx->last_decomped_cqe = ctx->rq_cq_ctx.cqe;
+    // ctx->last_decomped_cqe = ctx->rq_cq_ctx.cqe;
 
     struct flexio_dev_cqe64 *mini_cqe_block = ctx->rq_cq_ctx.cqe;
 	uint32_t cq_idx_mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
@@ -260,18 +261,13 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
         current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
         current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i + 1U);
 
-        // current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-        // current_cqe->op_own = (0xF0 & (~0x01)) | (current_own_bit & 0x01);
-        // current_cqe->op_own = (0xF0);
+        current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
     }
 
     ctx->comp_packets_count += mini_cqe_num;
 }
 
 static int decompress_wrapper(struct app_device_ctx *ctx) {
-    __dpa_thread_memory_writeback();
-    __dpa_thread_fence(__DPA_MEMORY, __DPA_RW, __DPA_RW);
     int ret = 0;
 
     if (ctx->hostcq_enabled) __dpa_thread_window_read_inv();
@@ -280,8 +276,6 @@ static int decompress_wrapper(struct app_device_ctx *ctx) {
     else if (flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) ret = -1;
 
     if (ctx->hostcq_enabled) __dpa_thread_window_writeback();
-    __dpa_thread_memory_writeback();
-    __dpa_thread_fence(__DPA_MEMORY, __DPA_RW, __DPA_RW);
 
     return ret;
 }
@@ -473,22 +467,26 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     uint64_t last_reported_packet_count = ctx->packets_count;
     // uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
+fuck:
     if (decompress_wrapper(ctx) == -1) goto deschedule;
-    if (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) == ctx->rq_cq_ctx.cq_hw_owner_bit) {
+    if (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) == ctx->rq_cq_ctx.cq_hw_owner_bit && !flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
         ctx->test++;
-        if (ctx->test > 1) {
+        if (ctx->test > 0) {
+            ctx->rq_cq_ctx.cq_idx--;
+            ctx->rq_cq_ctx.cqe = &ctx->rq_cq_ctx.cq_ring[ctx->rq_cq_ctx.cq_idx & CQ_IDX_MASK];
+            if (!(ctx->rq_cq_ctx.cq_idx & CQ_IDX_MASK))
+                ctx->rq_cq_ctx.cq_hw_owner_bit = !ctx->rq_cq_ctx.cq_hw_owner_bit;
+            goto fuck;
+            if (ctx->thread_index > 30) flexio_dev_thread_reschedule();
             flexio_dev_print("id=%u, cqe=%lx, idx=%u, nonono\n", ctx->thread_index, (uint64_t) ctx->rq_cq_ctx.cqe, ctx->rq_cq_ctx.cq_idx);
-            // flexio_dev_print("cq_idx=%u, nonono\n", ctx->rq_cq_ctx.cq_idx);
-            // flexio_dev_print("opown=%x, nonono\n", ctx->rq_cq_ctx.cqe->op_own);
-            // flexio_dev_print("hw=%x, nonono\n", ctx->rq_cq_ctx.cq_hw_owner_bit);
-            // flexio_dev_print("dead?=%x, nonono\n", ctx->rq_cq_ctx.cqe->rsvd00[3]);
-            // flexio_dev_print("dead?=%x, nonono\n", ctx->rq_cq_ctx.cqe->byte_cnt);
-            /* Update the memory to the chip */
-            if (ctx->thread_index) flexio_dev_thread_reschedule();
-            flexio_dev_print("last = %lx\n", (uint64_t)ctx->last_decomped_cqe);
-            for (uint32_t i = 0; i < 8; i++) {
-                flexio_dev_print("checked%u = %lx\n", i, (uint64_t)ctx->checked_cq[i]);
-            }
+            flexio_dev_print("while_out_cqe = %lx, while_out_opown = %x\n", (uint64_t) ctx->while_out_cqe, ctx->while_out_opown);
+            flexio_dev_print("dbr = %u\n", (uint32_t) be32_to_cpu(*ctx->rq_cq_ctx.cq_dbr));
+
+
+            // flexio_dev_print("last = %lx\n", (uint64_t)ctx->last_decomped_cqe);
+            // for (uint32_t i = 0; i < 8; i++) {
+                // flexio_dev_print("checked%u = %lx\n", i, (uint64_t)ctx->checked_cq[i]);
+            // }
             for (uint32_t i = 0; i < 9; i++) {
                 flexio_dev_print("---------------------------------------------\n");
                 struct flexio_dev_cqe64 *current_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4 + i) & CQ_IDX_MASK];
@@ -499,7 +497,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     }
     else if (ctx->test > 0) {
         ctx->test = 0;
-        flexio_dev_print("id=%u, yesyes\n", ctx->thread_index);
+        // flexio_dev_print("id=%u, yesyes\n", ctx->thread_index);
         // flexio_dev_print("cq_idx=%u, yesyes\n", ctx->rq_cq_ctx.cq_idx);
         // flexio_dev_print("opown=%x, yesyes\n", ctx->rq_cq_ctx.cqe->op_own);
         // flexio_dev_print("hw=%x, yesyes\n", ctx->rq_cq_ctx.cq_hw_owner_bit);
@@ -524,7 +522,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 			process_packet(ctx);
 		/* Update RQ CQ */
 		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
-        ctx->checked_cq[ctx->rq_cq_ctx.cq_idx & 0x7] = ctx->rq_cq_ctx.cqe;
+        // ctx->checked_cq[ctx->rq_cq_ctx.cq_idx & 0x7] = ctx->rq_cq_ctx.cqe;
         update_data_from_host_cq_idx(data_from_host, ctx);
 
         #define DOORBELL_BURST 12U
@@ -542,9 +540,10 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         if (decompress_wrapper(ctx) == -1) goto deschedule;
 	}
     __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
-    dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - ctx->last_doorbelled_packet_count));
-    ctx->last_doorbelled_packet_count = ctx->packets_count;
     update_data_from_host_report(data_from_host, ctx);
+
+    ctx->while_out_cqe = ctx->rq_cq_ctx.cqe;
+    ctx->while_out_opown = ctx->rq_cq_ctx.cqe->op_own;
 
 deschedule:
 	/* Update the memory to the chip */
