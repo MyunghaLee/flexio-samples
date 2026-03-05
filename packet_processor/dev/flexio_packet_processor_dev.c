@@ -85,6 +85,10 @@ struct app_device_ctx {
 	/* Per-invocation DPA window pointers (set at start of each handler call) */
 	flexio_uintptr_t rqd_dpa_base;
 	flexio_uintptr_t sqd_dpa_base;
+    uint32_t test;
+    struct flexio_dev_cqe64 *last_decomped_cqe;
+    struct flexio_dev_cqe64 *checked_cq[8];
+    uint64_t last_doorbelled_packet_count;
 };
 
 /* Static array of per-thread contexts. Each event handler is pinned to a dedicated EU,
@@ -174,10 +178,64 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 	com_dt_ctx_init(&ctx->dt_ctx, data_from_host->sq_transf.wqd_daddr);
 }
 
+static void print_full_cqe64(struct flexio_dev_cqe64 *cqe)
+{
+	flexio_dev_print("CQE64 dump begin\n");
+    flexio_dev_print("ptr: %lx\n", (uint64_t) cqe);
+	flexio_dev_print("  rsvd00[0]=0x%08x rsvd00[1]=0x%08x rsvd00[2]=0x%08x rsvd00[3]=0x%08x rsvd00[4]=0x%08x\n",
+			be32_to_cpu(cqe->rsvd00[0]), be32_to_cpu(cqe->rsvd00[1]),
+			be32_to_cpu(cqe->rsvd00[2]), be32_to_cpu(cqe->rsvd00[3]),
+			be32_to_cpu(cqe->rsvd00[4]));
+	flexio_dev_print("  csum_ok=0x%04x rsvd22[0]=0x%02x rsvd22[1]=0x%02x\n",
+			be16_to_cpu(cqe->csum_ok), cqe->rsvd22[0], cqe->rsvd22[1]);
+	flexio_dev_print("  rsvd24[0]=0x%08x rsvd24[1]=0x%08x\n",
+			be32_to_cpu(cqe->rsvd24[0]), be32_to_cpu(cqe->rsvd24[1]));
+	flexio_dev_print("  srqn_uidx=0x%08x imm_inval_pkey=0x%08x\n",
+			be32_to_cpu(cqe->srqn_uidx), be32_to_cpu(cqe->imm_inval_pkey));
+	flexio_dev_print("  rsvd40=0x%08x byte_cnt=%u rsvd48=0x%08x\n",
+			be32_to_cpu(cqe->rsvd40), be32_to_cpu(cqe->byte_cnt),
+			be32_to_cpu(cqe->rsvd48));
+	flexio_dev_print("  hw_err_syndrome=0x%02x rsvd50=0x%02x vendor_err_synd=0x%02x syndrome=0x%02x\n",
+			cqe->hw_err_syndrome, cqe->rsvd50, cqe->vendor_err_synd, cqe->syndrome);
+	flexio_dev_print("  sop_rdrop=0x%02x qpn24=[0x%02x 0x%02x 0x%02x] qpn=0x%08x\n",
+			cqe->sop_rdrop, cqe->qpn24[0], cqe->qpn24[1], cqe->qpn24[2],
+			be32_to_cpu(cqe->qpn));
+	flexio_dev_print("  wqe_counter=%u signature=0x%02x validity_iteration_count=0x%02x\n",
+			be16_to_cpu(cqe->wqe_counter), cqe->signature,
+			cqe->validity_iteration_count);
+	flexio_dev_print("  op_own=0x%02x (owner=%u opcode=%u type=%u)\n",
+			cqe->op_own, flexio_dev_cqe_get_owner(cqe),
+			flexio_dev_cqe_get_opcode(cqe), flexio_dev_cqe_get_type(cqe));
+	flexio_dev_print("CQE64 dump end\n");
+}
+
+// static void print_full_mini_cqe64(struct flexio_dev_mini_cqe64 *mini_cqe)
+// {
+	// int i;
+
+	// flexio_dev_print("mini-CQE64 dump begin\n");
+    // flexio_dev_print("ptr: %lx\n", (uint64_t) mini_cqe);
+	// for (i = 0; i < 7; i++) {
+		// flexio_dev_print("  mini_cqe[%d]=0x%016llx\n", i,
+				 // (unsigned long long)be64_to_cpu(mini_cqe->mini_cqe[i]));
+	// }
+	// for (i = 0; i < 6; i++) {
+		// flexio_dev_print("  rsvd0[%d]=0x%02x\n", i, mini_cqe->rsvd0[i]);
+	// }
+	// flexio_dev_print("  validity_iteration_count=0x%02x\n",
+			 // mini_cqe->validity_iteration_count);
+	// flexio_dev_print("  num_and_type=0x%02x\n", mini_cqe->num_and_type);
+	// flexio_dev_print("  parsed: is_comp_array=%u num_comp_cqes=%u\n",
+			 // flexio_dev_comp_cqe_is_comp_cqe_array((struct flexio_dev_cqe64 *)mini_cqe),
+			 // flexio_dev_comp_cqe_get_num_comp_cqes((struct flexio_dev_cqe64 *)mini_cqe));
+	// flexio_dev_print("mini-CQE64 dump end\n");
+// }
+
 static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
     if (!flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
         return;
     }
+    ctx->last_decomped_cqe = ctx->rq_cq_ctx.cqe;
 
     struct flexio_dev_cqe64 *mini_cqe_block = ctx->rq_cq_ctx.cqe;
 	uint32_t cq_idx_mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
@@ -202,13 +260,18 @@ static void decompress_if_cqe_is_compressed(struct app_device_ctx *ctx) {
         current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
         current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + i + 1U);
 
-        current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+        // current_cqe->op_own = (current_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+        // current_cqe->op_own = (0xF0 & (~0x01)) | (current_own_bit & 0x01);
+        // current_cqe->op_own = (0xF0);
     }
 
     ctx->comp_packets_count += mini_cqe_num;
 }
 
 static int decompress_wrapper(struct app_device_ctx *ctx) {
+    __dpa_thread_memory_writeback();
+    __dpa_thread_fence(__DPA_MEMORY, __DPA_RW, __DPA_RW);
     int ret = 0;
 
     if (ctx->hostcq_enabled) __dpa_thread_window_read_inv();
@@ -217,6 +280,8 @@ static int decompress_wrapper(struct app_device_ctx *ctx) {
     else if (flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) ret = -1;
 
     if (ctx->hostcq_enabled) __dpa_thread_window_writeback();
+    __dpa_thread_memory_writeback();
+    __dpa_thread_fence(__DPA_MEMORY, __DPA_RW, __DPA_RW);
 
     return ret;
 }
@@ -375,6 +440,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		app_ctx_init(ctx, data_from_host);
         update_data_from_host_cq_idx(data_from_host, ctx);
 		data_from_host->not_first_run = 1;
+        ctx->last_doorbelled_packet_count = ctx->packets_count;
 	}
 
 	/* Configure the window every invocation (window state resets between invocations).
@@ -403,15 +469,49 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 		}
 	}
 
-    uint64_t last_packet_count = ctx->packets_count;
-    
-    uint64_t last_doorbelled_packet_count = ctx->packets_count;
+    (void) ctx;
+    uint64_t last_reported_packet_count = ctx->packets_count;
+    // uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
     if (decompress_wrapper(ctx) == -1) goto deschedule;
+    if (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) == ctx->rq_cq_ctx.cq_hw_owner_bit) {
+        ctx->test++;
+        if (ctx->test > 1) {
+            flexio_dev_print("id=%u, cqe=%lx, idx=%u, nonono\n", ctx->thread_index, (uint64_t) ctx->rq_cq_ctx.cqe, ctx->rq_cq_ctx.cq_idx);
+            // flexio_dev_print("cq_idx=%u, nonono\n", ctx->rq_cq_ctx.cq_idx);
+            // flexio_dev_print("opown=%x, nonono\n", ctx->rq_cq_ctx.cqe->op_own);
+            // flexio_dev_print("hw=%x, nonono\n", ctx->rq_cq_ctx.cq_hw_owner_bit);
+            // flexio_dev_print("dead?=%x, nonono\n", ctx->rq_cq_ctx.cqe->rsvd00[3]);
+            // flexio_dev_print("dead?=%x, nonono\n", ctx->rq_cq_ctx.cqe->byte_cnt);
+            /* Update the memory to the chip */
+            if (ctx->thread_index) flexio_dev_thread_reschedule();
+            flexio_dev_print("last = %lx\n", (uint64_t)ctx->last_decomped_cqe);
+            for (uint32_t i = 0; i < 8; i++) {
+                flexio_dev_print("checked%u = %lx\n", i, (uint64_t)ctx->checked_cq[i]);
+            }
+            for (uint32_t i = 0; i < 9; i++) {
+                flexio_dev_print("---------------------------------------------\n");
+                struct flexio_dev_cqe64 *current_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4 + i) & CQ_IDX_MASK];
+                print_full_cqe64(current_cqe);
+            }
+            flexio_dev_thread_reschedule();
+        }
+    }
+    else if (ctx->test > 0) {
+        ctx->test = 0;
+        flexio_dev_print("id=%u, yesyes\n", ctx->thread_index);
+        // flexio_dev_print("cq_idx=%u, yesyes\n", ctx->rq_cq_ctx.cq_idx);
+        // flexio_dev_print("opown=%x, yesyes\n", ctx->rq_cq_ctx.cqe->op_own);
+        // flexio_dev_print("hw=%x, yesyes\n", ctx->rq_cq_ctx.cq_hw_owner_bit);
+        // return;
+    }
 
 	/* Poll CQ until the package is received. */
+	// while (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) !=
+	       // ctx->rq_cq_ctx.cq_hw_owner_bit) {
 	while (flexio_dev_cqe_get_owner(ctx->rq_cq_ctx.cqe) !=
-	       ctx->rq_cq_ctx.cq_hw_owner_bit) {
+	       ctx->rq_cq_ctx.cq_hw_owner_bit){
+        //&& flexio_dev_comp_cqe_is_comp_cqe_array(ctx->rq_cq_ctx.cqe)) {
 		/* Print the message */
 		// flexio_dev_print("Process packet: %ld\n", ctx->packets_count++);
         ctx->packets_count++;
@@ -424,25 +524,26 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 			process_packet(ctx);
 		/* Update RQ CQ */
 		com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
+        ctx->checked_cq[ctx->rq_cq_ctx.cq_idx & 0x7] = ctx->rq_cq_ctx.cqe;
         update_data_from_host_cq_idx(data_from_host, ctx);
 
         #define DOORBELL_BURST 12U
-        if (ctx->packets_count - last_doorbelled_packet_count == DOORBELL_BURST) {
+        if (ctx->packets_count - ctx->last_doorbelled_packet_count == DOORBELL_BURST) {
             __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
             dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, DOORBELL_BURST);
-            last_doorbelled_packet_count = ctx->packets_count;
+            ctx->last_doorbelled_packet_count = ctx->packets_count;
         }
 
-        if (ctx->packets_count - last_packet_count > 10000) {
-            last_packet_count = ctx->packets_count;
+        if (ctx->packets_count - last_reported_packet_count > 10000) {
+            last_reported_packet_count = ctx->packets_count;
             update_data_from_host_report(data_from_host, ctx);
         }
 
         if (decompress_wrapper(ctx) == -1) goto deschedule;
 	}
     __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
-    dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - last_doorbelled_packet_count));
-    last_doorbelled_packet_count = ctx->packets_count;
+    dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - ctx->last_doorbelled_packet_count));
+    ctx->last_doorbelled_packet_count = ctx->packets_count;
     update_data_from_host_report(data_from_host, ctx);
 
 deschedule:
