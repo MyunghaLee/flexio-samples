@@ -129,11 +129,7 @@ struct thread_ctx {
 	flexio_uintptr_t app_data_daddr;
 
 	uint32_t thread_index;
-    uint8_t rsvd[5];
-    uint8_t hostbuf_enable;
-    uint8_t hostcq_enable;      /* 1 = RQ CQ ring in host memory (same window as data bufs) */
-    uint8_t hostdecomp_enable;  /* 1 = host observer decompresses CQEs for this thread */
-
+    uint8_t rsvd[12];
 }  __attribute__((__packed__, aligned(64))) ;
 
 /* Application context struct holding necessary host side variables. */
@@ -288,6 +284,7 @@ cleanup:
 /* SQ/RQ DATA byte size is queue depth times entry byte size. */
 #define Q_DATA_BSIZE Q_DEPTH *Q_DATA_ENTRY_BSIZE
 
+#ifndef HOSTBUF
 /* Creates an MKey with proper permissions for access from DPA.
  * For this application, we only need memory write access.
  * Returns pointer to flexio_mkey structure on success. Otherwise, returns NULL.
@@ -317,6 +314,7 @@ static struct flexio_mkey *create_dpa_mkey(struct app_context *app_ctx, flexio_u
 
 	return mkey;
 }
+#endif
 
 /* Base source MAC address; thread n matches SMAC = BASE_SMAC + n. */
 #define BASE_SMAC 0x02427e7feb02ULL
@@ -433,6 +431,7 @@ static int cq_mem_alloc(struct flexio_process *process, struct app_transfer_cq *
 	return ret;
 }
 
+#ifdef HOSTCQ
 /* Allocate RQ CQ memory with ring in host memory (within combined data buffer, hostcq mode).
  * The combined buffer must have been allocated by sq_mem_alloc_hostbuf before this call.
  * Only allocates CQ DBR on DPA heap; the ring resides at data_hbuf + 2*Q_DATA_BSIZE.
@@ -485,6 +484,7 @@ static int rq_cq_mem_alloc_host(struct app_context *app_ctx, struct thread_ctx *
 	t->rq_cq_transf.cq_ring_daddr = 0;
 	return 0;
 }
+#endif
 
 /* SQ WQE byte size is 64B. */
 #define LOG_SQ_WQE_BSIZE 6
@@ -492,6 +492,7 @@ static int rq_cq_mem_alloc_host(struct app_context *app_ctx, struct thread_ctx *
 #define SQ_WQE_BSIZE L2V(LOG_SQ_WQE_BSIZE)
 /* SQ ring byte size is queue depth times WQE byte size. */
 #define SQ_RING_BSIZE (Q_DEPTH * SQ_WQE_BSIZE)
+#ifndef HOSTBUF
 /* Allocate DPA heap memory for SQ.
  * Returns 0 on success and -1 if the allocation fails.
  * process - pointer to the previously allocated process info.
@@ -511,7 +512,9 @@ static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 
 	return 0;
 }
+#endif
 
+#ifdef HOSTBUF
 /* Allocate host memory and register a single MR for both RQ and SQ data buffers (hostbuf mode).
  * The combined buffer layout: [RQ data | SQ data], each Q_DATA_BSIZE bytes.
  * One ibv lkey covers both halves, so only FLEXIO_DEV_WINDOW_ENTITY_0 is needed on the DPA.
@@ -528,7 +531,11 @@ static int sq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *
 	 * Layout: [RQ data (Q_DATA_BSIZE) | SQ data (Q_DATA_BSIZE) | CQ ring (CQ_BSIZE)]
 	 * A single ibv_reg_mr covers all three regions under one lkey.
 	 */
-	size_t hbuf_size = t->hostcq_enable ? (2 * Q_DATA_BSIZE + CQ_BSIZE) : (2 * Q_DATA_BSIZE);
+    #ifdef HOSTCQ
+	size_t hbuf_size = 2 * Q_DATA_BSIZE + CQ_BSIZE;
+    #else
+	size_t hbuf_size = 2 * Q_DATA_BSIZE;
+    #endif
 
 	if (posix_memalign(&t->data_hbuf, CQ_BSIZE, hbuf_size)) {
 		printf("Failed to allocate host memory for combined data buffer\n");
@@ -561,6 +568,7 @@ static int sq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *
 
 	return 0;
 }
+#endif
 
 /* Create an SQ over the DPA for sending packets from DPA to wire.
  * A CQ is also created for the SQ.
@@ -619,8 +627,12 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	/* Set SQ's CQ depth in communication struct. */
 	t->sq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
 	/* Allocate SQ memory (ring and data). Data goes to host or DPA depending on mode. */
-	if (t->hostbuf_enable ? sq_mem_alloc_hostbuf(app_ctx, t, &t->sq_transf) :
-	                        sq_mem_alloc(app_fp, &t->sq_transf)) {
+    #ifdef HOSTBUF
+	if (sq_mem_alloc_hostbuf(app_ctx, t, &t->sq_transf))
+    #else
+	if (sq_mem_alloc(app_fp, &t->sq_transf))
+    #endif
+    {
 		printf("Failed to allocate memory for SQ\n");
 		return -1;
 	}
@@ -650,15 +662,15 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	/* Fetch SQ's number to communicate to DPA side. */
 	t->sq_transf.wq_num = flexio_sq_get_wq_num(t->flexio_sq_ptr);
 
+    #ifndef HOSTBUF
 	/* Create an MKey for SQ data buffer (DPA mode only; hostbuf uses ibv lkey from MR). */
-	if (!t->hostbuf_enable) {
-		t->sqd_mkey = create_dpa_mkey(app_ctx, t->sq_transf.wqd_daddr);
-		if (!t->sqd_mkey) {
-			printf("Failed to create an MKey for SQ data buffer\n");
-			return -1;
-		}
-		t->sq_transf.wqd_mkey_id = flexio_mkey_get_id(t->sqd_mkey);
-	}
+    t->sqd_mkey = create_dpa_mkey(app_ctx, t->sq_transf.wqd_daddr);
+    if (!t->sqd_mkey) {
+        printf("Failed to create an MKey for SQ data buffer\n");
+        return -1;
+    }
+    t->sq_transf.wqd_mkey_id = flexio_mkey_get_id(t->sqd_mkey);
+    #endif
 
 	return 0;
 }
@@ -669,6 +681,7 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 #define RQ_WQE_BSIZE L2V(LOG_RQ_WQE_BSIZE)
 /* RQ ring byte size is queue depth times WQE byte size. */
 #define RQ_RING_BSIZE (Q_DEPTH * RQ_WQE_BSIZE)
+#ifndef HOSTBUF
 /* Allocate DPA heap memory for SQ.
  * Returns 0 on success and -1 if the allocation fails.
  * process - pointer to the previously allocated process info.
@@ -696,7 +709,9 @@ static int rq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 
 	return 0;
 }
+#endif
 
+#ifdef HOSTBUF
 /* Set up RQ data transfer info for hostbuf mode using the combined buffer.
  * The combined buffer (data_hbuf / data_mr) was already allocated by sq_mem_alloc_hostbuf.
  * RQ occupies the first half; this function sets wqd_daddr/wqd_mkey_id accordingly and
@@ -731,6 +746,7 @@ static int rq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *
 
 	return 0;
 }
+#endif
 
 /* Initialize an RQ ring memory over the DPA heap memory.
  * RQ WQEs need to be initialized (produced) by SW so they are ready for incoming packets.
@@ -820,16 +836,18 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	/* RQ's CQ number. */
 	uint32_t cq_num;
 
+    #ifdef HOSTCQ
 	/* Allocate CQ memory: ring in host memory when hostcq, else on DPA heap. */
-	if (t->hostcq_enable) {
-		if (rq_cq_mem_alloc_host(app_ctx, t)) {
-			printf("Failed to alloc host memory for RQ's CQ.\n");
-			return -1;
-		}
-	} else if (cq_mem_alloc(app_fp, &t->rq_cq_transf)) {
-		printf("Failed to alloc memory for RQ's CQ.\n");
-		return -1;
-	}
+    if (rq_cq_mem_alloc_host(app_ctx, t)) {
+        printf("Failed to alloc host memory for RQ's CQ.\n");
+        return -1;
+    }
+    #else
+    if (cq_mem_alloc(app_fp, &t->rq_cq_transf)) {
+        printf("Failed to alloc memory for RQ's CQ.\n");
+        return -1;
+    }
+    #endif
 
 	/* Set CQ depth (log) attribute. */
 	rqcq_attr.log_cq_depth = LOG_Q_DEPTH;
@@ -847,18 +865,18 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	/* CQ DBR always on DPA heap for direct DPA access. */
 	rqcq_attr.cq_dbr_daddr = t->rq_cq_transf.cq_dbr_daddr;
 	/* CQ ring: host UMEM when hostcq, else DPA heap. */
-	if (t->hostcq_enable) {
-		rqcq_attr.cq_ring_qmem.memtype    = FLEXIO_MEMTYPE_HOST;
-		rqcq_attr.cq_ring_qmem.humem_offset = 0;
-		rqcq_attr.cq_ring_qmem.umem_id    = t->rq_cq_ring_umem->umem_id;
-	} else {
-		rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
-	}
+    #ifdef HOSTCQ
+    rqcq_attr.cq_ring_qmem.memtype    = FLEXIO_MEMTYPE_HOST;
+    rqcq_attr.cq_ring_qmem.humem_offset = 0;
+    rqcq_attr.cq_ring_qmem.umem_id    = t->rq_cq_ring_umem->umem_id;
+    #else
+    rqcq_attr.cq_ring_qmem.daddr = t->rq_cq_transf.cq_ring_daddr;
+    #endif
 
     #if CQE_COMP==0
-        rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_NONE;
+    rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_NONE;
     #else
-        rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_ENABLE;
+    rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_ENABLE;
     #endif
 	/* Create CQ for RQ. */
 	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
@@ -873,21 +891,25 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	/* Set RQ's CQ depth in communication struct. */
 	t->rq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
 	/* Allocate RQ memory (ring and data). Data goes to host or DPA depending on mode. */
-	if (t->hostbuf_enable ? rq_mem_alloc_hostbuf(app_ctx, t, &t->rq_transf) :
-	                        rq_mem_alloc(app_fp, &t->rq_transf)) {
+    #ifdef HOSTBUF
+	if (rq_mem_alloc_hostbuf(app_ctx, t, &t->rq_transf))
+    #else
+	if (rq_mem_alloc(app_fp, &t->rq_transf))
+    #endif
+    {
 		printf("Failed to allocate memory for RQ.\n");
 		return -1;
 	}
 
+    #ifndef HOSTBUF
 	/* Create an MKey for RQ data buffer (DPA mode only; hostbuf uses ibv lkey from MR). */
-	if (!t->hostbuf_enable) {
-		t->rqd_mkey = create_dpa_mkey(app_ctx, t->rq_transf.wqd_daddr);
-		if (!t->rqd_mkey) {
-			printf("Failed to create an MKey for RQ data buffer.\n");
-			return -1;
-		}
-		t->rq_transf.wqd_mkey_id = flexio_mkey_get_id(t->rqd_mkey);
-	}
+    t->rqd_mkey = create_dpa_mkey(app_ctx, t->rq_transf.wqd_daddr);
+    if (!t->rqd_mkey) {
+        printf("Failed to create an MKey for RQ data buffer.\n");
+        return -1;
+    }
+    t->rq_transf.wqd_mkey_id = flexio_mkey_get_id(t->rqd_mkey);
+    #endif
 	/* Initialize RQ ring. */
 	if (init_dpa_rq_ring(app_fp, &t->rq_transf)) {
 		printf("Failed to init RQ ring.\n");
@@ -1008,16 +1030,13 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	/* Set APP data info for first run. */
 	h2d_data->not_first_run = 0;
 	/* Propagate host-buffer mode, window ID, zero-copy, hostcq, and hostdecomp to DPA. */
-	h2d_data->hostbuf_enabled = t->hostbuf_enable;
-	h2d_data->hostcq_enabled = t->hostcq_enable;
-	h2d_data->hostdecomp_enabled = t->hostdecomp_enable;
 	h2d_data->window_id = app_ctx->window ? flexio_window_get_id(app_ctx->window) : 0;
 	/* When hostcq is on, pass the host VA of the CQ ring in cq_ring_daddr.
 	 * DPA interprets this as a host VA to map through the window.
 	 */
-	if (t->hostcq_enable)
-		h2d_data->rq_cq_transf.cq_ring_daddr =
-			(flexio_uintptr_t)(uintptr_t)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
+    #ifdef HOSTCQ
+    h2d_data->rq_cq_transf.cq_ring_daddr = (flexio_uintptr_t)(uintptr_t)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
+    #endif
 
 	/* Copy to DPA heap memory.
 	 * Allocated DPA heap memory address will be kept in t->app_data_daddr.
@@ -1090,10 +1109,12 @@ static int clean_up_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	}
 
 	/* Clean up memory key for rqd if created (DPA mode only) */
-	if (!t->hostbuf_enable && t->rqd_mkey && flexio_device_mkey_destroy(t->rqd_mkey)) {
+    #ifndef HOSTBUF
+	if (t->rqd_mkey && flexio_device_mkey_destroy(t->rqd_mkey)) {
 		printf("Failed to destroy mkey RQD\n");
 		err = -1;
 	}
+    #endif
 
 	/* Clean up DBR daddr if created */
 	if (t->rq_transf.wq_dbr_daddr &&
@@ -1109,14 +1130,15 @@ static int clean_up_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 		err = -1;
 	}
 
-	if (!t->hostbuf_enable) {
-		if (t->rq_transf.wqd_daddr &&
-		    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wqd_daddr)) {
-			printf("Failed to free rq_transf.wqd_daddr\n");
-			err = -1;
-		}
-	}
+    #ifndef HOSTBUF
+    if (t->rq_transf.wqd_daddr &&
+        flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wqd_daddr)) {
+        printf("Failed to free rq_transf.wqd_daddr\n");
+        err = -1;
+    }
+    #else
 	/* In hostbuf mode the combined buffer and its MR are freed in clean_up_thread_sq. */
+    #endif
 
 	if (t->flexio_rq_cq_ptr && flexio_cq_destroy(t->flexio_rq_cq_ptr)) {
 		printf("Failed to destroy RQ CQ\n");
@@ -1165,10 +1187,12 @@ static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	}
 
 	/* Clean up memory key for sqd if created (DPA mode only) */
-	if (!t->hostbuf_enable && t->sqd_mkey && flexio_device_mkey_destroy(t->sqd_mkey)) {
+    #ifndef HOSTBUF
+	if (t->sqd_mkey && flexio_device_mkey_destroy(t->sqd_mkey)) {
 		printf("Failed to destroy mkey SQD\n");
 		err = -1;
 	}
+    #endif
 
 	if (t->sq_transf.wq_ring_daddr &&
 	    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wq_ring_daddr)) {
@@ -1176,23 +1200,23 @@ static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 		err = -1;
 	}
 
-	if (t->hostbuf_enable) {
-		/* Host buffer mode: deregister the single combined MR and free the buffer.
-		 * Both RQ and SQ halves are covered by data_mr / data_hbuf.
-		 */
-		if (t->data_mr && ibv_dereg_mr(t->data_mr)) {
-			printf("Failed to deregister combined data MR\n");
-			err = -1;
-		}
-		free(t->data_hbuf);
-		t->data_hbuf = NULL;
-	} else {
-		if (t->sq_transf.wqd_daddr &&
-		    flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wqd_daddr)) {
-			printf("Failed to free sq_transf.wqd_daddr\n");
-			err = -1;
-		}
-	}
+    #ifdef HOSTBUF
+    /* Host buffer mode: deregister the single combined MR and free the buffer.
+    * Both RQ and SQ halves are covered by data_mr / data_hbuf.
+    */
+    if (t->data_mr && ibv_dereg_mr(t->data_mr)) {
+        printf("Failed to deregister combined data MR\n");
+        err = -1;
+    }
+    free(t->data_hbuf);
+    t->data_hbuf = NULL;
+    #else
+    if (t->sq_transf.wqd_daddr &&
+        flexio_buf_dev_free(app_ctx->flexio_process, t->sq_transf.wqd_daddr)) {
+        printf("Failed to free sq_transf.wqd_daddr\n");
+        err = -1;
+    }
+    #endif
 
 	if (t->flexio_sq_cq_ptr && flexio_cq_destroy(t->flexio_sq_cq_ptr)) {
 		printf("Failed to destroy SQ CQ\n");
@@ -1349,6 +1373,7 @@ static int system_prompt(struct app_context *app_ctx)
 /* Host decompression latency report interval (in number of mini-CQEs). */
 #define HOST_DECOMP_LAT_REPORT_MINI 1000000ULL
 
+#if CQE_COMP==2
 static uint64_t host_now_ns(void)
 {
 	struct timespec ts;
@@ -1566,10 +1591,12 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 
 	memset(ctx, 0, sizeof(*ctx));
 
+    #if CQE_COMP==2
 	for (i = 0; i < (uint32_t)app_ctx->num_threads; i++) {
-		if (app_ctx->threads[i].hostdecomp_enable)
-			active++;
+        active++;
 	}
+    #endif
+
 	if (!active)
 		return 0;
 
@@ -1584,7 +1611,12 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 		struct hostdecomp_queue_ctx *qctx = &ctx->queues[i];
 		struct thread_ctx *t = &app_ctx->threads[i];
 
-		qctx->enabled = t->hostdecomp_enable;
+        #if CQE_COMP==2
+        qctx->enabled = 1;
+        #else
+        qctx->enabled = 0;
+        #endif
+
 		if (!qctx->enabled)
 			continue;
 
@@ -1643,6 +1675,7 @@ static int hostdecomp_stop(struct hostdecomp_ctx *ctx)
 	ctx->thread_started = 0;
 	return 0;
 }
+#endif
 
 /* dev msg stream buffer built from chunks of 2^FLEXIO_MSG_DEV_LOG_DATA_CHUNK_BSIZE each */
 #define MSG_HOST_BUFF_BSIZE (512 * L2V(FLEXIO_MSG_DEV_LOG_DATA_CHUNK_BSIZE))
@@ -1672,14 +1705,10 @@ int main(int argc, char **argv)
 	int nic_mode = 0;
 	/* Number of DPA threads to create (default 1 for backward compatibility) */
 	uint32_t num_threads = 1;
-	/* Host buffer mode: packet data buffers allocated in host memory instead of DPA heap. */
-	int hostbuf_enable = 0;
-	/* Host CQ mode: RQ CQ ring placed in host memory (same window as data buffers). */
-	int hostcq_enable = 0;
-	/* Host decomp mode: host observer thread decompresses CQEs for DPA threads. */
-	int hostdecomp_enable = 0;
 	/* Host decomp observer context. */
+    #if CQE_COMP==2
 	struct hostdecomp_ctx hostdecomp_ctx = {0};
+    #endif
 	/* Loop index */
 	int i;
 	/* Buffer for fread */
@@ -1691,7 +1720,7 @@ int main(int argc, char **argv)
 
 	/* Check input includes at least a device name. */
 	if (argc < 2) {
-		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--hostbuf on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
+		printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N]\n",
 		       argv[0]);
 		return -1;
 	}
@@ -1716,64 +1745,12 @@ int main(int argc, char **argv)
 			}
 			num_threads = (uint32_t)val;
 			i += 2;
-		} else if (!strcmp(argv[i], "--hostbuf")) {
-			if (i + 1 >= argc) {
-				printf("--hostbuf requires 'on' or 'off'\n");
-				return -1;
-			}
-			if (!strcmp(argv[i + 1], "on")) {
-				hostbuf_enable = 1;
-			} else if (!strcmp(argv[i + 1], "off")) {
-				hostbuf_enable = 0;
-			} else {
-				printf("--hostbuf value must be 'on' or 'off'\n");
-				return -1;
-			}
-			i += 2;
-		} else if (!strcmp(argv[i], "--hostcq")) {
-			if (i + 1 >= argc) {
-				printf("--hostcq requires 'on' or 'off'\n");
-				return -1;
-			}
-			if (!strcmp(argv[i + 1], "on")) {
-				hostcq_enable = 1;
-			} else if (!strcmp(argv[i + 1], "off")) {
-				hostcq_enable = 0;
-			} else {
-				printf("--hostcq value must be 'on' or 'off'\n");
-				return -1;
-			}
-			i += 2;
-		} else if (!strcmp(argv[i], "--hostdecomp")) {
-			if (i + 1 >= argc) {
-				printf("--hostdecomp requires 'on' or 'off'\n");
-				return -1;
-			}
-			if (!strcmp(argv[i + 1], "on")) {
-				hostdecomp_enable = 1;
-			} else if (!strcmp(argv[i + 1], "off")) {
-				hostdecomp_enable = 0;
-			} else {
-				printf("--hostdecomp value must be 'on' or 'off'\n");
-				return -1;
-			}
-			i += 2;
 		} else {
 			printf("Unknown argument: %s\n", argv[i]);
-			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N] [--hostbuf on|off] [--hostcq on|off] [--hostdecomp on|off]\n",
+			printf("Usage: %s <mlx5 device> [--nic-mode] [--threads N]\n",
 			       argv[0]);
 			return -1;
 		}
-	}
-
-	/* Validate mode dependencies: hostdecomp requires hostcq, hostcq requires hostbuf. */
-	if (hostdecomp_enable && !hostcq_enable) {
-		printf("--hostdecomp on requires --hostcq on\n");
-		return -1;
-	}
-	if (hostcq_enable && !hostbuf_enable) {
-		printf("--hostcq on requires --hostbuf on\n");
-		return -1;
 	}
 
 	app_ctx.num_threads = (int)num_threads;
@@ -1876,14 +1853,14 @@ int main(int argc, char **argv)
 	app_ctx.process_pd = flexio_process_get_pd(app_fp);
 	app_ctx.process_uar = flexio_process_get_uar(app_fp);
 
+    #ifdef HOSTBUF
 	/* Create FlexIO window for DPA→host memory access (host buffer mode only). */
-	if (hostbuf_enable) {
-		if (flexio_window_create(app_fp, app_ctx.process_pd, &app_ctx.window)) {
-			printf("Failed to create Flex IO window\n");
-			err = -1;
-			goto cleanup;
-		}
-	}
+    if (flexio_window_create(app_fp, app_ctx.process_pd, &app_ctx.window)) {
+        printf("Failed to create Flex IO window\n");
+        err = -1;
+        goto cleanup;
+    }
+    #endif
 
 	/* Allocate per-thread context array. calloc ensures all fields start as zero/NULL. */
 	app_ctx.threads = calloc(app_ctx.num_threads, sizeof(struct thread_ctx));
@@ -1898,9 +1875,6 @@ int main(int argc, char **argv)
 		struct thread_ctx *t = &app_ctx.threads[i];
 
 		t->thread_index    = (uint32_t)i;
-		t->hostbuf_enable  = (uint8_t)hostbuf_enable;
-		t->hostcq_enable   = (uint8_t)hostcq_enable;
-		t->hostdecomp_enable = (uint8_t)hostdecomp_enable;
 
 		/* Create an event handler pinned to EU i (FLEXIO_AFFINITY_STRICT). */
 		if (create_thread_event_handler(&app_ctx, t)) {
@@ -1953,17 +1927,14 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// /* Wait for Enter - the DPA sample is running in the meanwhile */
-	// if (!fread(buf, 1, 1, stdin)) {
-		// printf("Failed in fread\n");
-	// }
-
 	/* Start host decompression observer (no-op when hostdecomp_enable == 0). */
+    #if CQE_COMP==2
 	if (hostdecomp_start(&hostdecomp_ctx, &app_ctx)) {
 		printf("Failed to start hostdecomp observer\n");
 		err = -1;
 		goto cleanup;
 	}
+    #endif
 
 	if (system_prompt(&app_ctx)) {
 		printf("Failed to use system prompt");
@@ -1972,11 +1943,13 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
+    #if CQE_COMP==2
 	/* Stop the host decompression observer before tearing down hardware resources. */
 	if (hostdecomp_stop(&hostdecomp_ctx)) {
 		printf("Failed to stop hostdecomp observer\n");
 		err = -1;
 	}
+    #endif
 	/* Clean up flow is done in reverse order of creation as there's a reference system
 	 * that won't allow destroying resources that has references to existing resources.
 	 */
