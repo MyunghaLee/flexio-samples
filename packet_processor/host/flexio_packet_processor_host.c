@@ -1359,14 +1359,6 @@ static int system_prompt(struct app_context *app_ctx)
 }
 
 #if CQE_COMP==2
-static uint64_t host_now_ns(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
-}
-
 static struct host_cqe64 *hostdecomp_entry_addr(struct hostdecomp_queue_ctx *qctx,
 						  uint32_t cq_idx)
 {
@@ -1393,25 +1385,50 @@ static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
  */
 static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
 					 const struct host_mini_cqe64 *compressed_cqe,
-                     struct host_cqe64 *tmp_cqe,
-					 uint32_t mini_cqe_num)
+                     struct host_cqe64 *title_cqe,
+					 uint32_t mini_cqe_num
+					 )
 {
     uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
 
-	for (uint32_t i = 0; i < mini_cqe_num; i++) {
-		uint32_t target_idx = qctx->cq_idx + i;
+    uint64_t mini_cqes[7] = {0};
+    for (uint32_t i = 0; i < mini_cqe_num; i++) {
+        mini_cqes[i] = compressed_cqe->mini_cqe[i];
+    }
 
-		tmp_cqe->byte_cnt    = (uint32_t)((compressed_cqe->mini_cqe[i] >> 32) & 0xFFFFFFFFULL);
-		tmp_cqe->rsvd00[3]   = (uint32_t)(compressed_cqe->mini_cqe[i] & 0xFFFFFFFFULL);
-		tmp_cqe->wqe_counter = htobe16((uint16_t)(be16toh(tmp_cqe->wqe_counter) + 1u));
+    struct host_cqe64 *current_cqe = NULL;
+    uint8_t current_own_bit = (title_cqe->op_own & 0x1);
+    { // i = 0
+        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
+        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
+    }
+	for (uint32_t i = 1; i < mini_cqe_num; i++) {
+        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx + i) & mask];
+        current_own_bit = ((qctx->cq_idx + i) & mask) ? current_own_bit : !current_own_bit;
 
-		tmp_cqe->op_own = (uint8_t)((tmp_cqe->op_own & (uint8_t)~0x1u) | (((target_idx & mask) ? tmp_cqe->op_own : ~tmp_cqe->op_own) & 0x1u));
+        memcpy(current_cqe, title_cqe, 64);
 
-        flexio_uintptr_t dest_daddr = hostdecomp_entry_addr(qctx, qctx->cq_idx + i);
-        //todo. memcpy tmp_cqe to dest_daddr location on dpa_mem. wait for it to be fully writen back.
+        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
+        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
+        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + i + 1U);
+
+        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
 	}
+    { // i = 0
+        current_own_bit = (title_cqe->op_own & 0x1);
+        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
+        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
 
-	__atomic_thread_fence(__ATOMIC_RELEASE);
+        memcpy(current_cqe, title_cqe, 63);
+
+        current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
+        current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
+        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + 1U);
+
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+    }
+
 	return 0;
 }
 
@@ -1432,32 +1449,39 @@ static void *hostdecomp_poll_thread(void *arg)
     } 
 
 	struct hostdecomp_ctx *ctx = arg;
-	struct host_cqe64 current_cqe = {0};
-	struct host_cqe64 tmp_cqe = {0};
 
 	if (!ctx->num_queues || !ctx->queues)
 		return NULL;
 
 	while (!ctx->stop) {
 		struct hostdecomp_queue_ctx *qctx = &ctx->queues[ctx->next_queue_idx];
-        ctx->next_queue_idx = (ctx->next_queue_idx + 1U) % ctx->num_queues; 
+        ctx->next_queue_idx = (ctx->next_queue_idx + 1U) % ctx->num_queues;
 
-        flexio_uintptr_t src_daddr = hostdecomp_entry_addr(qctx, qctx->cq_idx);
-        // todo. memcpy dpa mem's src_daddr content to current_cqe;
+        uint32_t scanned_cqe = 0;
+        while (scanned_cqe < HOSTDECOMP_BURST) {
+            /* CQ ring is in host memory — read directly via pointer. */
+            struct host_cqe64 *current_cqe = hostdecomp_entry_addr(qctx, qctx->cq_idx);
+            volatile uint8_t *current_opown_ptr = (volatile uint8_t *) &current_cqe->op_own;
+            uint8_t current_opown = *current_opown_ptr;
 
-        if (((current_cqe.op_own>>2) & 0x3) == 0x3) {
-            flexio_uintptr_t src_title_daddr = hostdecomp_entry_addr(qctx, qctx->cq_idx - 1U);
-            // todo. memcpy dpa mem's src_title_daddr content to tmp_cqe;
-            uint32_t mini_cqe_num = ((current_cqe.op_own>>4) & 0xF) + 1U;
-            hostdecomp_decompress_current(qctx, &current_cqe, &tmp_cqe, mini_cqe_num);
-            hostdecomp_advance(qctx, mini_cqe_num);
-            continue;
-        }
+            if (((current_opown>>2) & 0x3) == 0x3) {
+                /* Title CQE is the entry just before the compressed block. */
+                struct host_cqe64 *title_cqe = hostdecomp_entry_addr(qctx, qctx->cq_idx - 1U);
+                uint32_t mini_cqe_num = ((current_opown>>4) & 0xF) + 1U;
+                hostdecomp_decompress_current(qctx, (struct host_mini_cqe64 *) current_cqe, (struct host_cqe64 *) title_cqe, mini_cqe_num);
 
-        if ((current_cqe.op_own & 0x1) != qctx->cq_hw_owner_bit) {
-            qctx->cq_idx += 1U;
-            hostdecomp_advance(qctx, 1);
-            continue;
+                hostdecomp_advance(qctx, mini_cqe_num);
+                scanned_cqe += mini_cqe_num;
+                continue;
+            }
+
+            if ((current_opown & 0x1) != qctx->cq_hw_owner_bit) {
+                hostdecomp_advance(qctx, 1);
+                scanned_cqe += 1;
+                continue;
+            }
+
+            break;
         }
 	}
 
@@ -1491,7 +1515,8 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 		struct hostdecomp_queue_ctx *qctx = &ctx->queues[i];
 		struct thread_ctx *t = &app_ctx->threads[i];
 
-		qctx->cq_ring_addr  = NULL; //todo. this should be modified to dpa mem's cq addr.
+		/* CQ ring lives in the third region of the combined host buffer. */
+		qctx->cq_ring_addr   = (struct host_cqe64 *)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
 		qctx->thread_index   = t->thread_index;
 		qctx->cq_idx         = 0;
 		qctx->log_cq_depth   = LOG_Q_DEPTH;
@@ -1514,8 +1539,6 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 /* Stop the host decompression observer thread and print final latency stats. */
 static int hostdecomp_stop(struct hostdecomp_ctx *ctx)
 {
-	uint32_t i;
-
 	if (!ctx->thread_started)
 		return 0;
 

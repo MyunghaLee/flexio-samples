@@ -205,6 +205,10 @@ static void decompress_packet(struct app_device_ctx *ctx) {
     }
 
     ctx->comp_packets_count += mini_cqe_num;
+
+    #ifdef HOSTCQ
+    __dpa_thread_window_read_inv();
+    #endif
 }
 #endif
 
@@ -320,7 +324,6 @@ static void update_data_from_host_report(struct host2dev_packet_processor_data *
     data_from_host->report_packets_count = ctx->packets_count;
     data_from_host->report_comp_packets_count = ctx->comp_packets_count;
     data_from_host->heartbeat++;
-    __dpa_thread_memory_writeback();
 }
 
 /* Entry point function that host side calls for execution.
@@ -382,8 +385,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 
 	/* Poll CQ until the package is received. */
 	while (1) {
-        __dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
-        // maybe we would need __dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
         volatile uint8_t *current_op_own_ptr = (volatile uint8_t *) &ctx->rq_cq_ctx.cqe->op_own;
         uint8_t current_op_own = *current_op_own_ptr;
 
@@ -394,7 +395,8 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         }
         #elif CQE_COMP==2
         if (((current_op_own>>2) & 0x3) == 0x3) {
-            break;
+            __dpa_thread_window_read_inv();
+            continue;
         }
         #endif
 
@@ -418,8 +420,12 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
             continue;
         }
 
+
         break;
 	}
+    #ifdef HOSTCQ
+    __dpa_thread_window_read_inv();
+    #endif
     __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
     dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - last_doorbelled_packet_count));
     update_data_from_host_report(data_from_host, ctx);
