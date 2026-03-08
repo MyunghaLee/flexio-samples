@@ -323,13 +323,6 @@ static void update_data_from_host_report(struct host2dev_packet_processor_data *
     __dpa_thread_memory_writeback();
 }
 
-#if CQE_COMP==2
-static void update_data_from_host_cq_idx(struct host2dev_packet_processor_data *data_from_host, struct app_device_ctx *ctx) {
-    data_from_host->dpa_current_cq_idx = ctx->rq_cq_ctx.cq_idx;
-    __dpa_thread_memory_writeback();
-}
-#endif
-
 /* Entry point function that host side calls for execution.
  *  thread_arg - pointer to the host2dev_packet_processor_data structure
  *     to transfer data from the host side.
@@ -354,9 +347,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	/* If the thread is executed for first time, then initialize the context. */
 	if (!data_from_host->not_first_run) {
 		app_ctx_init(ctx, data_from_host);
-        #if CQE_COMP==2
-        update_data_from_host_cq_idx(data_from_host, ctx);
-        #endif
 		data_from_host->not_first_run = 1;
 	}
 
@@ -393,6 +383,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	/* Poll CQ until the package is received. */
 	while (1) {
         __dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
+        // maybe we would need __dpa_thread_fence(__DPA_MEMORY, __DPA_R, __DPA_R);
         volatile uint8_t *current_op_own_ptr = (volatile uint8_t *) &ctx->rq_cq_ctx.cqe->op_own;
         uint8_t current_op_own = *current_op_own_ptr;
 
@@ -413,9 +404,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
             process_packet(ctx);
             #endif
             com_step_cq_with_one_padding(&ctx->rq_cq_ctx);
-            #if CQE_COMP==2
-            update_data_from_host_cq_idx(data_from_host, ctx);
-            #endif
 
             if (ctx->packets_count - last_doorbelled_packet_count >= DOORBELL_BURST) {
                 __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);

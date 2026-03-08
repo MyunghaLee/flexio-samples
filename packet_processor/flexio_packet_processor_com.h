@@ -93,14 +93,10 @@ struct host2dev_packet_processor_data {
     uint64_t report_packets_count;
     uint64_t report_comp_packets_count; // until here 128B
 	uint32_t thread_index;   /* Index into device-side app_ctxs[] */
-    uint32_t dpa_current_cq_idx; /* used for host's CQE decompression */
 	uint32_t window_id;      /* FlexIO window ID for DPA→host memory access */
     uint16_t heartbeat;
 	uint8_t  not_first_run;
-	// uint8_t  hostbuf_enabled;  /* 1 = packet data buffers in host memory */
-    // uint8_t  hostcq_enabled; /* 1 = CQ locates in host memory */
-    // uint8_t  hostdecomp_enabled; /* 1 = host does the CQE decompression */
-    uint8_t  rsvd[49];
+    uint8_t  rsvd[53];
 } __attribute__((__packed__, aligned(64)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */

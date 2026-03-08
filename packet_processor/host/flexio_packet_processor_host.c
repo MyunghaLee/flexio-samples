@@ -199,19 +199,17 @@ struct host_mini_cqe64 {
 
 /* Per-DPA-thread state for the host decompression observer. */
 struct hostdecomp_queue_ctx {
-	struct host_cqe64 *cq_ring_haddr; /* host pointer to the CQ ring */
+	struct host_cqe64 *cq_ring_addr; /* pointer to the CQ ring which is on DPA mem */
 	uint32_t thread_index;
 	uint32_t cq_idx;
 	uint32_t log_cq_depth;
-	uint8_t  cq_hw_owner_bit;
-	int      enabled;                  /* 1 if this thread uses hostdecomp */
-	uint8_t  has_title_cqe;
-	struct host_cqe64 title_cqe;
-	int      no_title_warned;
+    uint8_t  cq_hw_owner_bit;
+    uint8_t  rsvd0[11];
 	uint64_t decomp_total_ns;
 	uint64_t decomp_total_mini;
 	uint64_t decomp_last_report_mini;
-};
+    uint8_t  rsvd1[8];
+}__attribute__((__packed__, aligned(64)));
 
 /* Single host observer that rotates across all DPA threads' CQ rings. */
 struct hostdecomp_ctx {
@@ -221,7 +219,8 @@ struct hostdecomp_ctx {
 	pthread_t thread;
 	int thread_started;
 	volatile int stop;
-};
+    uint8_t rsvd[32];
+}__attribute__((__packed__, aligned(64)));
 
 /* Open ibv device
  * Returns 0 on success and -1 if the destroy was failed.
@@ -1350,18 +1349,7 @@ static int system_prompt(struct app_context *app_ctx)
 				       (double)total_comp / (double)total_pkts * 100.0);
 			else
 				printf("Compress percentage: N/A (no packets received)\n");
-		} else if (cmd == 99) {
-            // wait for 5 seconds
-            // struct timespec start, now;
-            // clock_gettime(CLOCK_MONOTONIC, &start);
-            // long end_sec = start.tv_sec + 5;
-            // long end_nsec = start.tv_nsec;
-            // while (1) {
-                // clock_gettime(CLOCK_MONOTONIC, &now);
-                // if (now.tv_sec > end_sec || (now.tv_sec == end_sec && now.tv_nsec >= end_nsec)) break;
-                // _mm_pause();
-            // }
-        }
+		} 
 		/* else: ignore unrecognized input */
 	}
 
@@ -1369,9 +1357,6 @@ static int system_prompt(struct app_context *app_ctx)
 	free(snap_after);
 	return 0;
 }
-
-/* Host decompression latency report interval (in number of mini-CQEs). */
-#define HOST_DECOMP_LAT_REPORT_MINI 1000000ULL
 
 #if CQE_COMP==2
 static uint64_t host_now_ns(void)
@@ -1382,31 +1367,12 @@ static uint64_t host_now_ns(void)
 	return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
 }
 
-static uint8_t host_cqe_get_owner(const struct host_cqe64 *cqe)
-{
-	return cqe->op_own & 0x1;
-}
-
-static uint8_t host_comp_cqe_is_comp_cqe_array(const struct host_cqe64 *cqe)
-{
-	const struct host_mini_cqe64 *mini = (const struct host_mini_cqe64 *)cqe;
-
-	return ((mini->num_and_type >> 2) & 0x3) == 0x3;
-}
-
-static uint8_t host_comp_cqe_get_num_comp_cqes(const struct host_cqe64 *cqe)
-{
-	const struct host_mini_cqe64 *mini = (const struct host_mini_cqe64 *)cqe;
-
-	return (mini->num_and_type >> 4) + 1;
-}
-
-static struct host_cqe64 *hostdecomp_entry_haddr(struct hostdecomp_queue_ctx *qctx,
+static struct host_cqe64 *hostdecomp_entry_addr(struct hostdecomp_queue_ctx *qctx,
 						  uint32_t cq_idx)
 {
 	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
 
-	return &qctx->cq_ring_haddr[cq_idx & mask];
+	return &qctx->cq_ring_addr[cq_idx & mask];
 }
 
 static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
@@ -1426,56 +1392,23 @@ static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
  * Returns 0 on success, -1 if no title CQE is available.
  */
 static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
-					 const struct host_cqe64 *compressed_cqe,
+					 const struct host_mini_cqe64 *compressed_cqe,
+                     struct host_cqe64 *tmp_cqe,
 					 uint32_t mini_cqe_num)
 {
-	const struct host_mini_cqe64 *mini = (const struct host_mini_cqe64 *)compressed_cqe;
-	uint64_t mini_cqes[7] = {0};
-	uint8_t current_own_bit;
-	uint32_t i;
+    uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
 
-	if (!qctx->has_title_cqe)
-		return -1;
-	if (!mini_cqe_num)
-		return 0;
-	if (mini_cqe_num > 7)
-		mini_cqe_num = 7;
-
-	/* Temporarily hide the compressed entry from DPA by setting the wrong owner bit.
-	 * This prevents DPA from reading a partially-written CQE block.
-	 */
-	{
-		struct host_cqe64 *head = hostdecomp_entry_haddr(qctx, qctx->cq_idx);
-
-		head->op_own = (uint8_t)((head->op_own & (uint8_t)~0x1u) |
-					 (qctx->cq_hw_owner_bit & 0x1u));
-		__atomic_thread_fence(__ATOMIC_RELEASE);
-	}
-
-	for (i = 0; i < mini_cqe_num; i++)
-		mini_cqes[i] = mini->mini_cqe[i];
-
-	current_own_bit = host_cqe_get_owner(&qctx->title_cqe);
-	for (i = 0; i < mini_cqe_num; i++) {
+	for (uint32_t i = 0; i < mini_cqe_num; i++) {
 		uint32_t target_idx = qctx->cq_idx + i;
-		uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
-		struct host_cqe64 *current_cqe = hostdecomp_entry_haddr(qctx, target_idx);
 
-		/* Owner bit flips when the consumer index wraps around. */
-		current_own_bit = (target_idx & mask) ? current_own_bit
-						       : (uint8_t)!current_own_bit;
+		tmp_cqe->byte_cnt    = (uint32_t)((compressed_cqe->mini_cqe[i] >> 32) & 0xFFFFFFFFULL);
+		tmp_cqe->rsvd00[3]   = (uint32_t)(compressed_cqe->mini_cqe[i] & 0xFFFFFFFFULL);
+		tmp_cqe->wqe_counter = htobe16((uint16_t)(be16toh(tmp_cqe->wqe_counter) + 1u));
 
-		memcpy(current_cqe, &qctx->title_cqe, sizeof(*current_cqe));
-		current_cqe->byte_cnt    = (uint32_t)((mini_cqes[i] >> 32) & 0xFFFFFFFFULL);
-		current_cqe->rsvd00[3]   = (uint32_t)(mini_cqes[i] & 0xFFFFFFFFULL);
-		current_cqe->wqe_counter = htobe16(
-			(uint16_t)(be16toh(qctx->title_cqe.wqe_counter) + i + 1u));
-		current_cqe->op_own = (uint8_t)((current_cqe->op_own & (uint8_t)~0x1u) |
-					         (current_own_bit & 0x1u));
+		tmp_cqe->op_own = (uint8_t)((tmp_cqe->op_own & (uint8_t)~0x1u) | (((target_idx & mask) ? tmp_cqe->op_own : ~tmp_cqe->op_own) & 0x1u));
 
-		/* Keep title_cqe updated to the last decompressed entry. */
-		if (i + 1 == mini_cqe_num)
-			memcpy(&qctx->title_cqe, current_cqe, sizeof(qctx->title_cqe));
+        flexio_uintptr_t dest_daddr = hostdecomp_entry_addr(qctx, qctx->cq_idx + i);
+        //todo. memcpy tmp_cqe to dest_daddr location on dpa_mem. wait for it to be fully writen back.
 	}
 
 	__atomic_thread_fence(__ATOMIC_RELEASE);
@@ -1499,84 +1432,33 @@ static void *hostdecomp_poll_thread(void *arg)
     } 
 
 	struct hostdecomp_ctx *ctx = arg;
-	struct host_cqe64 first = {0}, second = {0};
-	uint32_t mini_cqe_num;
-	struct hostdecomp_queue_ctx *qctx;
+	struct host_cqe64 current_cqe = {0};
+	struct host_cqe64 tmp_cqe = {0};
 
 	if (!ctx->num_queues || !ctx->queues)
 		return NULL;
 
 	while (!ctx->stop) {
-		qctx = &ctx->queues[ctx->next_queue_idx];
+		struct hostdecomp_queue_ctx *qctx = &ctx->queues[ctx->next_queue_idx];
+        ctx->next_queue_idx = (ctx->next_queue_idx + 1U) % ctx->num_queues; 
 
-		if (!qctx->enabled) {
-			ctx->next_queue_idx = (ctx->next_queue_idx + 1) % ctx->num_queues;
-			continue;
-		}
+        flexio_uintptr_t src_daddr = hostdecomp_entry_addr(qctx, qctx->cq_idx);
+        // todo. memcpy dpa mem's src_daddr content to current_cqe;
 
-		/* Read the current CQE twice and require a stable snapshot to avoid
-		 * acting on a torn entry while the NIC is writing it.
-		 */
-		__atomic_thread_fence(__ATOMIC_ACQUIRE);
-		memcpy(&first,  hostdecomp_entry_haddr(qctx, qctx->cq_idx), sizeof(first));
-		__atomic_thread_fence(__ATOMIC_ACQUIRE);
-		memcpy(&second, hostdecomp_entry_haddr(qctx, qctx->cq_idx), sizeof(second));
-		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (((current_cqe.op_own>>2) & 0x3) == 0x3) {
+            flexio_uintptr_t src_title_daddr = hostdecomp_entry_addr(qctx, qctx->cq_idx - 1U);
+            // todo. memcpy dpa mem's src_title_daddr content to tmp_cqe;
+            uint32_t mini_cqe_num = ((current_cqe.op_own>>4) & 0xF) + 1U;
+            hostdecomp_decompress_current(qctx, &current_cqe, &tmp_cqe, mini_cqe_num);
+            hostdecomp_advance(qctx, mini_cqe_num);
+            continue;
+        }
 
-		if (memcmp(&first, &second, sizeof(first)))
-			continue; /* Torn read — retry same queue */
-
-		/* CQE not yet written by NIC (owner matches SW-expected bit) and not
-		 * a compressed block: move to the next thread's queue.
-		 */
-		if (host_cqe_get_owner(&second) == qctx->cq_hw_owner_bit &&
-		    !host_comp_cqe_is_comp_cqe_array(&second)) {
-			ctx->next_queue_idx = (ctx->next_queue_idx + 1) % ctx->num_queues;
-			continue;
-		}
-
-		if (host_comp_cqe_is_comp_cqe_array(&second)) {
-			mini_cqe_num = host_comp_cqe_get_num_comp_cqes(&second);
-
-			uint64_t t0 = host_now_ns();
-			uint64_t elapsed;
-
-			if (hostdecomp_decompress_current(qctx, &second, mini_cqe_num)) {
-				if (!qctx->no_title_warned) {
-					printf("hostdecomp: no title CQE for thread %u cq_idx=%u\n",
-					       qctx->thread_index, qctx->cq_idx);
-					qctx->no_title_warned = 1;
-				}
-				ctx->next_queue_idx = (ctx->next_queue_idx + 1) % ctx->num_queues;
-				continue;
-			}
-
-			qctx->no_title_warned = 0;
-			elapsed = host_now_ns() - t0;
-			qctx->decomp_total_ns   += elapsed;
-			qctx->decomp_total_mini += mini_cqe_num;
-
-			if ((qctx->decomp_total_mini - qctx->decomp_last_report_mini) >=
-			    HOST_DECOMP_LAT_REPORT_MINI) {
-				// printf("hostdecomp latency: thread=%u avg=%llu ns/mini samples=%llu\n",
-				       // qctx->thread_index,
-				       // (unsigned long long)(qctx->decomp_total_ns /
-							    // qctx->decomp_total_mini),
-				       // (unsigned long long)qctx->decomp_total_mini);
-				qctx->decomp_last_report_mini = qctx->decomp_total_mini;
-			}
-
-			hostdecomp_advance(qctx, mini_cqe_num);
-			continue;
-		}
-
-		/* Regular title CQE — save it for use as the template when decompressing
-		 * the next compressed block.
-		 */
-		qctx->title_cqe     = second;
-		qctx->has_title_cqe = 1;
-		qctx->no_title_warned = 0;
-		hostdecomp_advance(qctx, 1);
+        if ((current_cqe.op_own & 0x1) != qctx->cq_hw_owner_bit) {
+            qctx->cq_idx += 1U;
+            hostdecomp_advance(qctx, 1);
+            continue;
+        }
 	}
 
 	return NULL;
@@ -1591,11 +1473,9 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 
 	memset(ctx, 0, sizeof(*ctx));
 
-    #if CQE_COMP==2
 	for (i = 0; i < (uint32_t)app_ctx->num_threads; i++) {
         active++;
 	}
-    #endif
 
 	if (!active)
 		return 0;
@@ -1611,23 +1491,10 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 		struct hostdecomp_queue_ctx *qctx = &ctx->queues[i];
 		struct thread_ctx *t = &app_ctx->threads[i];
 
-        #if CQE_COMP==2
-        qctx->enabled = 1;
-        #else
-        qctx->enabled = 0;
-        #endif
-
-		if (!qctx->enabled)
-			continue;
-
-		/* CQ ring is at offset 2*Q_DATA_BSIZE within the combined buffer. */
-		qctx->cq_ring_haddr  = (struct host_cqe64 *)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
+		qctx->cq_ring_addr  = NULL; //todo. this should be modified to dpa mem's cq addr.
 		qctx->thread_index   = t->thread_index;
 		qctx->cq_idx         = 0;
 		qctx->log_cq_depth   = LOG_Q_DEPTH;
-		/* Initial HW owner bit = 1: CQEs are initialised to owner=1, meaning
-		 * they are NOT ready (owner == cq_hw_owner_bit means empty).
-		 */
 		qctx->cq_hw_owner_bit = 1;
 	}
 
@@ -1656,17 +1523,6 @@ static int hostdecomp_stop(struct hostdecomp_ctx *ctx)
 	if (pthread_join(ctx->thread, NULL)) {
 		printf("hostdecomp: failed to join observer thread\n");
 		return -1;
-	}
-
-	for (i = 0; i < ctx->num_queues; i++) {
-		struct hostdecomp_queue_ctx *qctx = &ctx->queues[i];
-
-		if (!qctx->enabled || !qctx->decomp_total_mini)
-			continue;
-		// printf("hostdecomp final: thread=%u avg=%llu ns/mini samples=%llu\n",
-		       // qctx->thread_index,
-		       // (unsigned long long)(qctx->decomp_total_ns / qctx->decomp_total_mini),
-		       // (unsigned long long)qctx->decomp_total_mini);
 	}
 
 	free(ctx->queues);
