@@ -388,6 +388,12 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         volatile uint8_t *current_op_own_ptr = (volatile uint8_t *) &ctx->rq_cq_ctx.cqe->op_own;
         uint8_t current_op_own = *current_op_own_ptr;
 
+        #ifdef HOSTCQ
+        __dpa_thread_outbox_fence(__DPA_R, __DPA_R);
+        #else
+        __dpa_thread_memory_fence(__DPA_R, __DPA_R);
+        #endif
+
         #if CQE_COMP==1
         if (((current_op_own>>2) & 0x3) == 0x3) {
             decompress_packet(ctx);
@@ -431,6 +437,10 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     update_data_from_host_report(data_from_host, ctx);
 
 	/* Update the memory to the chip */
+    #ifdef HOSTCQ
+    __dpa_thread_window_writeback();
+    #endif
+    __dpa_thread_memory_writeback();
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	/* Arming cq for next packet */
 	flexio_dev_cq_arm(ctx->rq_cq_ctx.cq_idx, ctx->rq_cq_ctx.cq_number);
