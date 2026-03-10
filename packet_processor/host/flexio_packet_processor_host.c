@@ -160,6 +160,18 @@ struct app_context {
 	/* FlexIO window for DPA→host memory access (created when --hostbuf on). */
 	struct flexio_window *window;
 
+	/* Single combined host allocation covering all threads + shared memos.
+	 * Layout: [thread0 (RQ|SQ|CQ)] ... [threadN-1 (RQ|SQ|CQ)] [dpa_memo] [cpu_memo]
+	 * One ibv_reg_mr covers the entire region; all threads share one lkey.
+	 */
+	void          *global_hbuf;
+	struct ibv_mr *global_mr;
+
+#if CQE_COMP==2
+	struct hostdecomp_thread_memo *shared_dpa_memo; /* first memo in global_hbuf tail */
+	struct hostdecomp_cpu_memo *shared_cpu_memo; /* second memo, shared_dpa_memo + 1 */
+#endif
+
     struct hostdecomp_ctx *decomp_ctx;
 };
 
@@ -205,7 +217,7 @@ struct host_mini_cqe64 {
 struct hostdecomp_queue_ctx {
 	struct host_cqe64 *cq_ring_addr; /* pointer to the CQ ring which is on DPA mem */
     struct hostdecomp_thread_memo *dpa_memo;
-    struct hostdecomp_thread_memo *cpu_memo;
+    struct hostdecomp_cpu_memo *cpu_memo;
 	uint32_t thread_index;
 	uint32_t cq_idx;
 	uint32_t log_cq_depth;
@@ -519,54 +531,68 @@ static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 #endif
 
 #ifdef HOSTBUF
-/* Allocate host memory and register a single MR for both RQ and SQ data buffers (hostbuf mode).
- * The combined buffer layout: [RQ data | SQ data], each Q_DATA_BSIZE bytes.
- * One ibv lkey covers both halves, so only FLEXIO_DEV_WINDOW_ENTITY_0 is needed on the DPA.
- * sq_transf->wqd_daddr/wqd_mkey_id are set here; rq_transf fields are set by rq_mem_alloc_hostbuf.
+/* Per-thread region size within the global combined buffer.
+ * Each thread occupies: [RQ data (Q_DATA_BSIZE) | SQ data (Q_DATA_BSIZE) | CQ ring (CQ_BSIZE, HOSTCQ)]
+ */
+#ifdef HOSTCQ
+#define PER_THREAD_HBUF_SIZE (2 * Q_DATA_BSIZE + CQ_BSIZE)
+#else
+#define PER_THREAD_HBUF_SIZE (2 * Q_DATA_BSIZE)
+#endif
+
+/* Allocate the single global host buffer that covers all threads' RQ/SQ/CQ regions
+ * plus (when CQE_COMP==2) the two shared hostdecomp_thread_memo structs at the end.
+ * Registers one ibv_mr for the whole region so every thread shares one lkey.
+ * Must be called once after process_pd is available, before the per-thread setup loop.
  * Returns 0 on success and -1 on failure.
- * app_ctx  - pointer to app_context structure.
- * t        - pointer to thread_ctx for this thread.
- * sq_transf - SQ transfer struct to populate.
+ */
+static int alloc_global_hbuf(struct app_context *app_ctx)
+{
+	int n = app_ctx->num_threads;
+#if CQE_COMP==2
+	size_t total = (size_t)n * PER_THREAD_HBUF_SIZE + sizeof(struct hostdecomp_thread_memo) + sizeof(struct hostdecomp_cpu_memo);
+#else
+	size_t total = (size_t)n * PER_THREAD_HBUF_SIZE;
+#endif
+
+	if (posix_memalign(&app_ctx->global_hbuf, CQ_BSIZE, total)) {
+		printf("Failed to allocate global host buffer\n");
+		return -1;
+	}
+	memset(app_ctx->global_hbuf, 0, total);
+
+	app_ctx->global_mr = ibv_reg_mr(app_ctx->process_pd, app_ctx->global_hbuf, total,
+					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+					IBV_ACCESS_REMOTE_READ);
+	if (!app_ctx->global_mr) {
+		printf("Failed to register global host MR\n");
+		free(app_ctx->global_hbuf);
+		app_ctx->global_hbuf = NULL;
+		return -1;
+	}
+
+#if CQE_COMP==2
+	app_ctx->shared_dpa_memo = (struct hostdecomp_thread_memo *)
+		((char *)app_ctx->global_hbuf + (size_t)n * PER_THREAD_HBUF_SIZE);
+	app_ctx->shared_cpu_memo = (struct hostdecomp_cpu_memo *) (app_ctx->shared_dpa_memo + 1);
+#endif
+
+	return 0;
+}
+
+/* Set up SQ host-buffer pointers for one thread using the pre-allocated global buffer.
+ * t->data_hbuf is sliced from global_hbuf at thread_index * PER_THREAD_HBUF_SIZE.
+ * t->data_mr points to the global MR — do NOT dereg per thread.
+ * Returns 0 on success and -1 on failure.
  */
 static int sq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *t,
 				struct app_transfer_wq *sq_transf)
 {
-	/* When hostcq is also enabled, append a CQ ring after RQ+SQ data.
-	 * Layout: [RQ data (Q_DATA_BSIZE) | SQ data (Q_DATA_BSIZE) | CQ ring (CQ_BSIZE)]
-	 * A single ibv_reg_mr covers all three regions under one lkey.
-	 */
-    #ifdef HOSTCQ
-    #if CQE_COMP==2
-	size_t hbuf_size = 2 * Q_DATA_BSIZE + CQ_BSIZE + 2 * sizeof(struct hostdecomp_thread_memo);
-    #else
-	size_t hbuf_size = 2 * Q_DATA_BSIZE + CQ_BSIZE;
-    #endif
-    #else
-	size_t hbuf_size = 2 * Q_DATA_BSIZE;
-    #endif
+	t->data_hbuf = (char *)app_ctx->global_hbuf + (size_t)t->thread_index * PER_THREAD_HBUF_SIZE;
+	t->data_mr   = app_ctx->global_mr;
 
-	if (posix_memalign(&t->data_hbuf, CQ_BSIZE, hbuf_size)) {
-		printf("Failed to allocate host memory for combined data buffer\n");
-		return -1;
-	}
-	memset(t->data_hbuf, 0, hbuf_size);
-
-	/* Register a single MR covering the combined buffer.
-	 * NIC needs REMOTE_WRITE to DMA packets into the RQ half and REMOTE_READ to
-	 * fetch packet data from the SQ half. LOCAL_WRITE is required by the verbs API.
-	 */
-	t->data_mr = ibv_reg_mr(app_ctx->process_pd, t->data_hbuf, hbuf_size,
-			       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-			       IBV_ACCESS_REMOTE_READ);
-	if (!t->data_mr) {
-		printf("Failed to register MR for combined data host buffer\n");
-		free(t->data_hbuf);
-		t->data_hbuf = NULL;
-		return -1;
-	}
-
-	/* SQ occupies the second half of the combined buffer. */
-	sq_transf->wqd_daddr = (flexio_uintptr_t)((uintptr_t)t->data_hbuf + Q_DATA_BSIZE);
+	/* SQ occupies the second Q_DATA_BSIZE of this thread's region. */
+	sq_transf->wqd_daddr   = (flexio_uintptr_t)((uintptr_t)t->data_hbuf + Q_DATA_BSIZE);
 	sq_transf->wqd_mkey_id = t->data_mr->lkey;
 
 	/* Allocate DPA heap memory for SQ ring (descriptor ring stays on DPA). */
@@ -1043,9 +1069,10 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	 * DPA interprets this as a host VA to map through the window.
 	 */
     #if CQE_COMP==2
-    h2d_data->thread_memo = (flexio_uintptr_t)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE + CQ_BSIZE);
+    /* All threads share the same memo; pass its host VA. */
+    h2d_data->thread_memo = (flexio_uintptr_t)app_ctx->shared_dpa_memo;
     #else
-    h2d_data->thread_memo = NULL;
+    h2d_data->thread_memo = 0;
     #endif
     #ifdef HOSTCQ
     h2d_data->rq_cq_transf.cq_ring_daddr = (flexio_uintptr_t)(uintptr_t)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
@@ -1214,14 +1241,8 @@ static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	}
 
     #ifdef HOSTBUF
-    /* Host buffer mode: deregister the single combined MR and free the buffer.
-    * Both RQ and SQ halves are covered by data_mr / data_hbuf.
-    */
-    if (t->data_mr && ibv_dereg_mr(t->data_mr)) {
-        printf("Failed to deregister combined data MR\n");
-        err = -1;
-    }
-    free(t->data_hbuf);
+    /* Global MR and buffer are owned by app_context; freed once in main cleanup. */
+    t->data_mr   = NULL;
     t->data_hbuf = NULL;
     #else
     if (t->sq_transf.wqd_daddr &&
@@ -1379,7 +1400,7 @@ static int system_prompt(struct app_context *app_ctx)
             }
             for (i = 0; i < 8; i++) {
                 struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                printf("dpa thread %d's memo = %u, memo_ptr = %lx\n", i, current_qctx->dpa_memo->memo[i], (uint64_t)&current_qctx->dpa_memo->memo[i]);
+                printf("dpa thread %d's memo = %lu, memo_ptr = %lx\n", i, current_qctx->dpa_memo->memo[i], (uint64_t)&current_qctx->dpa_memo->memo[i]);
             }
         } else if (cmd == 6) {
             if (app_ctx->decomp_ctx == NULL) {
@@ -1433,28 +1454,81 @@ static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
 			qctx->cq_hw_owner_bit = !qctx->cq_hw_owner_bit;
 	}
 }
+#define CQE_BEFORE(cqe) ( \
+    ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
+    (((uintptr_t)(cqe) - CQE_BSIZE) & ((uintptr_t)CQ_BSIZE - 1)) \
+)
 
-static int hostdecomp_decompress(struct hostdecomp_ctx *ctx, uint32_t queue_idx, uint32_t cq_idx) {
-	uint32_t mask = (1u << LOG_CQ_DEPTH) - 1u;
-    uintptr_t title_cqe_addr = (uintptr_t) &ctx->queues[queue_idx].cq_ring_addr[(cq_idx-1U) & mask];
-    uintptr_t compressed_cqe_addr = (uintptr_t) &ctx->queues[queue_idx].cq_ring_addr[(cq_idx) & mask];
+#define CQE_AFTER(cqe) ( \
+    ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
+    (((uintptr_t)(cqe) + CQE_BSIZE) & ((uintptr_t)CQ_BSIZE - 1)) \
+)
 
-    uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *) title_cqe_addr);
-    uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *) compressed_cqe_addr);
-    printf("hhii\n");
+#define CQE_AFTER_VALUE(cqe, val) ( \
+    ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
+    (((uintptr_t)(cqe) + (CQE_BSIZE * (val))) & ((uintptr_t)CQ_BSIZE - 1)) \
+)
 
-    if (((vgetq_lane_u8(title_cqe.val[3], 15)) & 0x0C) == 0x0C) {
-        printf("error1\n");
-        return -1;
+static int hostdecomp_decompress(uint8_t *cqe) {
+    int ret = 0;
+    uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *)CQE_BEFORE(cqe));
+    uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *)(cqe)); (void) compressed_cqe;
+    uint8_t compressed_opown = vgetq_lane_u8(compressed_cqe.val[3], 15); (void) compressed_opown;
+
+    uint32_t mini_cqe_num = (uint32_t)(compressed_opown>>4) + 1U;
+
+    uint8_t *dst = cqe;
+    uint8_t dst_opown = vgetq_lane_u8(title_cqe.val[3], 15);
+
+    if (!((uint64_t)dst & (CQ_BSIZE-1))) dst_opown ^= 0x1;
+    uint8_t last_write_byte = dst_opown;
+    title_cqe.val[3] = vsetq_lane_u8((uint8_t)0x0C, title_cqe.val[3], 15);
+
+back:
+    ret += mini_cqe_num;
+    while (mini_cqe_num--) {
+        vst1q_u8_x4(dst, title_cqe);
+        dst = (uint8_t *) CQE_AFTER(dst);
+        if (!((uint64_t)dst & (CQ_BSIZE-1))) dst_opown ^= 0x1;
+        title_cqe.val[3] = vsetq_lane_u8(dst_opown, title_cqe.val[3], 15);
     }
-    if (((vgetq_lane_u8(compressed_cqe.val[3], 15)) & 0x0C) != 0x0C) {
-        printf("error2\n");
-        return -1;
+
+    volatile uint8_t *new_opown_ptr = (volatile uint8_t *) (dst + 63);
+    uint8_t new_opown = *new_opown_ptr;
+
+    if ((new_opown & 0x0C) == 0x0C && dst != cqe) {
+        compressed_cqe = vld1q_u8_x4((const uint8_t *)(dst));
+        mini_cqe_num = (uint32_t) (new_opown >> 4) + 1U;
+
+        goto back;
     }
-    //do something
-    return 0;
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *(cqe + 63) = last_write_byte;
+    return ret;
 }
 
+static int hostdecomp_work(uint8_t *cqe) {
+    uint8_t *scanning_cqe = cqe;
+    int scanned_cqe = 0;
+
+    int ret = hostdecomp_decompress(scanning_cqe);
+    scanned_cqe += ret;
+
+    scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, ret - 1);
+    uint8_t prev_opown = *(scanning_cqe + 63);
+
+    while (scanned_cqe < Q_DEPTH) {
+        scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, 1);
+        uint8_t scanning_opown = *(scanning_cqe + 63);
+
+        if ((scanning_opown & 0x0C))
+
+
+
+        prev_opown = scanning_opown;
+    }
+}
 /* Decompress a compressed CQE block in-place in host memory.
  * Mirrors the DPA-side decompress_if_cqe_is_compressed logic but runs on host CPU.
  * Returns 0 on success, -1 if no title CQE is available.
@@ -1556,6 +1630,7 @@ static void *hostdecomp_poll_thread(void *arg)
     (void) hostdecomp_decompress_current;
     (void) hostdecomp_advance;
     (void) hostdecomp_entry_addr;
+    (void) hostdecomp_work;
     int core_num = 15;
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset); 
@@ -1571,65 +1646,141 @@ static void *hostdecomp_poll_thread(void *arg)
 	if (!ctx->num_queues || !ctx->queues)
 		return NULL;
 
-    uint32_t memo_block_count = (uint32_t)((ctx->num_queues+31U) / 32);
+
+
+    uint32_t dpa_memo_block_count = (uint32_t)((ctx->num_queues+7U) / 8);
     struct hostdecomp_thread_memo *dpa_memo_addr = ctx->queues[0].dpa_memo;
-    struct hostdecomp_thread_memo *cpu_memo_addr = ctx->queues[0].cpu_memo;
+    struct hostdecomp_cpu_memo *cpu_memo_addr = ctx->queues[0].cpu_memo;
 
-    sleep(1);
 	while (!ctx->stop) {
-        for (uint32_t block_idx = 0; block_idx < memo_block_count; block_idx++) {
-            sleep(1);
-            uintptr_t dpa_block_addr = (uintptr_t) &dpa_memo_addr->memo[(block_idx<<5)];
-            uintptr_t cpu_block_addr = (uintptr_t) &cpu_memo_addr->memo[(block_idx<<5)];
-            uint8x16x4_t dpa_block = vld1q_u8_x4((const uint8_t *) dpa_block_addr);
-            uint8x16x4_t cpu_block = vld1q_u8_x4((const uint8_t *) cpu_block_addr);
+        for (uint32_t block_idx = 0; block_idx < dpa_memo_block_count; block_idx++) {
+            uintptr_t dpa_memo_block_addr = (uintptr_t) &dpa_memo_addr->memo[(block_idx<<3)];
+            uint8x16x4_t dpa_memo_block = vld1q_u8_x4((const uint8_t *) dpa_memo_block_addr);
+            uint8_t dpa_memo_indicator;
+            uint64_t dpa_memo_content;
 
-            printf("%lx, %lx\n", dpa_block_addr, cpu_block_addr);
-            print_uint8x16x4(dpa_block);
-            print_memoblock(dpa_block_addr);
-            for (uint32_t i = 0; i < 4; i++) {
-                uint8x16_t diff_vec = veorq_u8(dpa_block.val[i], cpu_block.val[i]);
-                if (vmaxvq_u8(diff_vec) != 0) {
+            // print_uint8x16x4(dpa_memo_block);
 
-                    uint16x8_t d_u16 = vreinterpretq_u16_u8(dpa_block.val[i]);
-                    uint16x8_t c_u16 = vreinterpretq_u16_u8(cpu_block.val[i]);
-
-                    if (vgetq_lane_u16(d_u16, 0) != vgetq_lane_u16(c_u16, 0)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 0);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+0U, (uint32_t)cq_idx_for_check);
-                    }
-                    if (vgetq_lane_u16(d_u16, 1) != vgetq_lane_u16(c_u16, 1)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 1);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+1U, (uint32_t)cq_idx_for_check);
-                    }
-                    if (vgetq_lane_u16(d_u16, 2) != vgetq_lane_u16(c_u16, 2)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 2);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+2U, (uint32_t)cq_idx_for_check);
-                    }
-                    if (vgetq_lane_u16(d_u16, 3) != vgetq_lane_u16(c_u16, 3)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 3);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+3U, (uint32_t)cq_idx_for_check);
-                    }
-                    if (vgetq_lane_u16(d_u16, 4) != vgetq_lane_u16(c_u16, 4)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 4);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+4U, (uint32_t)cq_idx_for_check);
-                    }
-                    if (vgetq_lane_u16(d_u16, 5) != vgetq_lane_u16(c_u16, 5)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 5);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+5U, (uint32_t)cq_idx_for_check);
-                    }
-                    if (vgetq_lane_u16(d_u16, 6) != vgetq_lane_u16(c_u16, 6)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 6);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+6U, (uint32_t)cq_idx_for_check);
-                    }
-                    if (vgetq_lane_u16(d_u16, 7) != vgetq_lane_u16(c_u16, 7)) {
-                        uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 7);
-                        hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+7U, (uint32_t)cq_idx_for_check);
-                    }
-                }
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[0], 0);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+0]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 0);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+0] = dpa_memo_indicator;
             }
 
-            vst1q_u8_x4((uint8_t *) cpu_block_addr, dpa_block);
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[0], 8);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+1]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 1);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+1] = dpa_memo_indicator;
+            }
+
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[1], 0);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+2]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 0);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+2] = dpa_memo_indicator;
+            }
+
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[1], 8);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+3]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 1);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+3] = dpa_memo_indicator;
+            }
+
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[2], 0);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+4]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 0);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+4] = dpa_memo_indicator;
+            }
+
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[2], 8);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+5]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 1);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+5] = dpa_memo_indicator;
+            }
+
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[3], 0);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+6]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 0);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+6] = dpa_memo_indicator;
+            }
+
+            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[3], 8);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+7]) {
+                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 1);
+                dpa_memo_content &= ~0x1ULL;
+                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                cpu_memo_addr->memo[(block_idx<<3)+7] = dpa_memo_indicator;
+            }
+
+
+
+
+            // for (uint32_t neon_reg_i = 0; neon_reg_i < 4; neon_reg_i++) {
+                // uint8_t dpa_memo_indicator;
+                // dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[neon_reg_i], 15);
+                // uint8x16_t diff_vec = veorq_u8(dpa_block.val[neon_reg_i], cpu_block.val[neon_reg_i]);
+                // if (vmaxvq_u8(diff_vec) != 0) {
+
+                    // uint16x8_t d_u16 = vreinterpretq_u16_u8(dpa_block.val[i]);
+                    // uint16x8_t c_u16 = vreinterpretq_u16_u8(cpu_block.val[i]);
+
+                    // if (vgetq_lane_u16(d_u16, 0) != vgetq_lane_u16(c_u16, 0)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 0);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+0U, (uint32_t)cq_idx_for_check);
+                    // }
+                    // if (vgetq_lane_u16(d_u16, 1) != vgetq_lane_u16(c_u16, 1)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 1);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+1U, (uint32_t)cq_idx_for_check);
+                    // }
+                    // if (vgetq_lane_u16(d_u16, 2) != vgetq_lane_u16(c_u16, 2)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 2);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+2U, (uint32_t)cq_idx_for_check);
+                    // }
+                    // if (vgetq_lane_u16(d_u16, 3) != vgetq_lane_u16(c_u16, 3)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 3);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+3U, (uint32_t)cq_idx_for_check);
+                    // }
+                    // if (vgetq_lane_u16(d_u16, 4) != vgetq_lane_u16(c_u16, 4)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 4);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+4U, (uint32_t)cq_idx_for_check);
+                    // }
+                    // if (vgetq_lane_u16(d_u16, 5) != vgetq_lane_u16(c_u16, 5)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 5);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+5U, (uint32_t)cq_idx_for_check);
+                    // }
+                    // if (vgetq_lane_u16(d_u16, 6) != vgetq_lane_u16(c_u16, 6)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 6);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+6U, (uint32_t)cq_idx_for_check);
+                    // }
+                    // if (vgetq_lane_u16(d_u16, 7) != vgetq_lane_u16(c_u16, 7)) {
+                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 7);
+                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+7U, (uint32_t)cq_idx_for_check);
+                    // }
+                // }
+            // }
+
+            // vst1q_u8_x4((uint8_t *) cpu_block_addr, dpa_block);
         }
 	}
 
@@ -1669,8 +1820,9 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 		qctx->cq_idx         = 0;
 		qctx->log_cq_depth   = LOG_Q_DEPTH;
 		qctx->cq_hw_owner_bit = 1;
-        qctx->dpa_memo       = (struct hostdecomp_thread_memo *)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE + CQ_BSIZE);
-        qctx->cpu_memo       = (struct hostdecomp_thread_memo *)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE + CQ_BSIZE + sizeof(struct hostdecomp_thread_memo));
+        /* All queues share the same memo structs at the tail of the global buffer. */
+        qctx->dpa_memo       = app_ctx->shared_dpa_memo;
+        qctx->cpu_memo       = app_ctx->shared_cpu_memo;
 	}
 
 	if (pthread_create(&ctx->thread, NULL, hostdecomp_poll_thread, ctx)) {
@@ -1884,12 +2036,18 @@ int main(int argc, char **argv)
 	app_ctx.process_uar = flexio_process_get_uar(app_fp);
 
     #ifdef HOSTBUF
-	/* Create FlexIO window for DPA→host memory access (host buffer mode only). */
+	/* Create FlexIO window for DPA→host memory access. */
     if (flexio_window_create(app_fp, app_ctx.process_pd, &app_ctx.window)) {
         printf("Failed to create Flex IO window\n");
         err = -1;
         goto cleanup;
     }
+	/* Allocate the single global host buffer (all threads' data + shared memos). */
+	if (alloc_global_hbuf(&app_ctx)) {
+		printf("Failed to allocate global host buffer.\n");
+		err = -1;
+		goto cleanup;
+	}
     #endif
 
 	/* Allocate per-thread context array. calloc ensures all fields start as zero/NULL. */
@@ -2032,6 +2190,15 @@ cleanup:
 	}
 
 	/* Destroy FlexIO window if created */
+    #ifdef HOSTBUF
+	/* Deregister and free the global host buffer. */
+	if (app_ctx.global_mr && ibv_dereg_mr(app_ctx.global_mr)) {
+		printf("Failed to deregister global host MR\n");
+		err = -1;
+	}
+	free(app_ctx.global_hbuf);
+	app_ctx.global_hbuf = NULL;
+    #endif
 	if (app_ctx.window && flexio_window_destroy(app_ctx.window)) {
 		printf("Failed to destroy Flex IO window\n");
 		err = -1;

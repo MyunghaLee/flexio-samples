@@ -81,7 +81,10 @@ struct app_transfer_wq {
 } __attribute__((__packed__, aligned(8)));
 
 struct hostdecomp_thread_memo {
-    uint16_t memo[192];
+    intptr_t memo[192];
+}  __attribute__((__packed__, aligned(64))) ;
+struct hostdecomp_cpu_memo {
+    uint8_t memo[192];
 }  __attribute__((__packed__, aligned(64))) ;
 
 /* Collateral structure for transfer host data to device */

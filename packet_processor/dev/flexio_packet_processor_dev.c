@@ -85,8 +85,10 @@ struct app_device_ctx {
 	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
 	uint32_t window_id;          /* FlexIO window ID */
 
-    uint8_t rsvd[16];
     uint32_t test;
+    uint8_t rsvd[14];
+    uint8_t wrote_for_host;
+    uint8_t indicator_for_host;
     flexio_uintptr_t thread_memo_haddr;
     struct hostdecomp_thread_memo *thread_memo;
 } __attribute__((__packed__, aligned(64)));
@@ -143,6 +145,8 @@ static void app_ctx_init(struct app_device_ctx *ctx,
     ctx->rqcq_haddr_base = data_from_host->rq_cq_transf.cq_ring_daddr;
     #endif
 
+    ctx->wrote_for_host = 0;
+    ctx->indicator_for_host = 1;
     ctx->thread_memo_haddr = data_from_host->thread_memo;
 
 	/* Set context for RQ's CQ.
@@ -415,6 +419,9 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     #endif
 
     #if CQE_COMP==2
+    /* The shared memo is in the same global MR as the thread data (ENTITY_0 window).
+     * Compute its DPA pointer as an offset from combined_dpa_base.
+     */
     ctx->thread_memo = (struct hostdecomp_thread_memo *)(uintptr_t)
         (combined_dpa_base + ((uint64_t)ctx->thread_memo_haddr - ctx->rqd_haddr_base));
     #endif
@@ -449,24 +456,27 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
                     flexio_dev_print("----------------------------------------\n");
                     flexio_dev_print("tid=%u, cqidx=%u, hw=%u, cqe=%lx\n", ctx->thread_index, ctx->rq_cq_ctx.cq_idx, ctx->rq_cq_ctx.cq_hw_owner_bit, (uint64_t)ctx->rq_cq_ctx.cqe);
                     for(uint32_t i = 0; i < 8; i++) {
-                        print_full_cqe64(&ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4U + i) & CQ_IDX_MASK]);
+                        // print_full_cqe64(&ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4U + i) & CQ_IDX_MASK]);
                     }
                     flexio_dev_thread_reschedule();
                     return;
                 }
             }
             }
-            volatile uint16_t *thread_memo_dst = (volatile uint16_t *) &ctx->thread_memo->memo[ctx->thread_index];
-            *thread_memo_dst = (uint16_t) (ctx->rq_cq_ctx.cq_idx & CQ_IDX_MASK) | ((((uint32_t) ctx->rq_cq_ctx.cq_hw_owner_bit) << 15));
-            // __dpa_thread_system_fence();
+            if (ctx->wrote_for_host == 0) {
+                ctx->wrote_for_host = 1;
+                volatile intptr_t *thread_memo_dst = (volatile intptr_t *) &ctx->thread_memo->memo[ctx->thread_index];
+                *thread_memo_dst = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
+                ctx->indicator_for_host = !ctx->indicator_for_host; 
+            }
             __dpa_thread_window_writeback();
             __dpa_thread_window_read_inv();
-            // __dpa_thread_system_fence();
             continue;
         }
         #endif
 
         if (likely(((current_op_own) & 0x1) != ctx->rq_cq_ctx.cq_hw_owner_bit)) {
+            ctx->wrote_for_host = 0;
             ctx->test = 0;
             ctx->packets_count++;
             #ifndef RXONLY
