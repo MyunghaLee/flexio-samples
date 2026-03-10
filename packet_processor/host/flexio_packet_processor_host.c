@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <sched.h>
+#include <arm_neon.h>
 /*
  * SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES.
  * Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -1367,6 +1368,18 @@ static struct host_cqe64 *hostdecomp_entry_addr(struct hostdecomp_queue_ctx *qct
 	return &qctx->cq_ring_addr[cq_idx & mask];
 }
 
+static void hostdecomp_recede(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
+{
+	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
+	uint32_t i;
+
+	for (i = 0; i < cqes; i++) {
+		if (!(qctx->cq_idx & mask))
+			qctx->cq_hw_owner_bit = !qctx->cq_hw_owner_bit;
+		qctx->cq_idx--;
+	}
+}
+
 static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
 {
 	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
@@ -1384,52 +1397,81 @@ static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
  * Returns 0 on success, -1 if no title CQE is available.
  */
 static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
-					 const struct host_mini_cqe64 *compressed_cqe,
-                     struct host_cqe64 *title_cqe,
+					 const struct host_mini_cqe64 *compressed_cqe_ptr,
+                     struct host_cqe64 *title_cqe_ptr,
 					 uint32_t mini_cqe_num
 					 )
 {
     uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
+    uint32_t local_cq_idx = qctx->cq_idx;
 
-    uint64_t mini_cqes[7] = {0};
-    for (uint32_t i = 0; i < mini_cqe_num; i++) {
-        mini_cqes[i] = compressed_cqe->mini_cqe[i];
+    uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *)title_cqe_ptr);
+    uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *)compressed_cqe_ptr);
+
+    uint8_t *dst = (uint8_t *) compressed_cqe_ptr;
+    
+    uint8_t current_opown = vgetq_lane_u8(title_cqe.val[3], 15);
+    uint8_t comp_last_byte = vgetq_lane_u8(compressed_cqe.val[3], 15);
+    title_cqe.val[3] = vsetq_lane_u8(comp_last_byte, title_cqe.val[3], 15);
+    vst1q_u8_x4(dst, title_cqe);
+    current_opown = (!(local_cq_idx & mask)) ? (current_opown ^ 0x1) : current_opown;
+    uint8_t last_write_byte = current_opown;
+    for (uint32_t i = 1; i < mini_cqe_num; i++) {
+        dst = dst + 64;
+        local_cq_idx++;
+        if (!(local_cq_idx & mask)) {
+            dst = dst - CQ_BSIZE;
+            current_opown = current_opown ^ 0x1;
+        }
+        title_cqe.val[3] = vsetq_lane_u8(current_opown, title_cqe.val[3], 15);
+        vst1q_u8_x4(dst, title_cqe);
     }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *(((uint8_t *)compressed_cqe_ptr) + 63) = last_write_byte;
+    return 0;
 
-    struct host_cqe64 *current_cqe = NULL;
-    uint8_t current_own_bit = (title_cqe->op_own & 0x1);
-    { // i = 0
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
-    }
-	for (uint32_t i = 1; i < mini_cqe_num; i++) {
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx + i) & mask];
-        current_own_bit = ((qctx->cq_idx + i) & mask) ? current_own_bit : !current_own_bit;
 
-        memcpy(current_cqe, title_cqe, 64);
+    // uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
 
-        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
-        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + i + 1U);
+    // uint64_t mini_cqes[7] = {0};
+    // for (uint32_t i = 0; i < mini_cqe_num; i++) {
+        // mini_cqes[i] = compressed_cqe->mini_cqe[i];
+    // }
 
-        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-	}
-    { // i = 0
-        current_own_bit = (title_cqe->op_own & 0x1);
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
+    // struct host_cqe64 *current_cqe = NULL;
+    // uint8_t current_own_bit = (title_cqe->op_own & 0x1);
+    // { // i = 0
+        // current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
+        // current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
+    // }
+	// for (uint32_t i = 1; i < mini_cqe_num; i++) {
+        // current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx + i) & mask];
+        // current_own_bit = ((qctx->cq_idx + i) & mask) ? current_own_bit : !current_own_bit;
 
-        memcpy(current_cqe, title_cqe, 63);
+        // memcpy(current_cqe, title_cqe, 64);
 
-        current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
-        current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + 1U);
+        // current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
+        // current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
+        // current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + i + 1U);
 
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-    }
+        // current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+	// }
+    // { // i = 0
+        // current_own_bit = (title_cqe->op_own & 0x1);
+        // current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
+        // current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
 
-	return 0;
+        // memcpy(current_cqe, title_cqe, 63);
+
+        // current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
+        // current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
+        // current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + 1U);
+
+        // __atomic_thread_fence(__ATOMIC_RELEASE);
+        // current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+    // }
+
+	// return 0;
 }
 
 /* Host observer thread: rotates across all DPA threads' host-memory CQ rings.
@@ -1461,12 +1503,28 @@ static void *hostdecomp_poll_thread(void *arg)
         while (scanned_cqe < HOSTDECOMP_BURST) {
             /* CQ ring is in host memory — read directly via pointer. */
             struct host_cqe64 *current_cqe = hostdecomp_entry_addr(qctx, qctx->cq_idx);
-            volatile uint8_t *current_opown_ptr = (volatile uint8_t *) &current_cqe->op_own;
-            uint8_t current_opown = *current_opown_ptr;
+            volatile uint16_t *current_vic_opown_ptr = (volatile uint16_t *) &current_cqe->validity_iteration_count;
+            uint16_t current_vic_opown = *current_vic_opown_ptr;
+            uint8_t current_vic = (uint8_t) (current_vic_opown & 0xFF);
+            uint8_t current_opown = (uint8_t) (current_vic_opown >> 8);
 
             if (((current_opown>>2) & 0x3) == 0x3) {
                 /* Title CQE is the entry just before the compressed block. */
                 struct host_cqe64 *title_cqe = hostdecomp_entry_addr(qctx, qctx->cq_idx - 1U);
+                volatile uint16_t *title_vic_opown_ptr = (volatile uint16_t *) &title_cqe->validity_iteration_count;
+                uint16_t title_vic_opown = *title_vic_opown_ptr;
+                uint8_t title_vic = (uint8_t) (title_vic_opown & 0xFF);
+                uint8_t title_opown = (uint8_t) (title_vic_opown >> 8);
+
+                if (current_vic != title_vic) {
+                    hostdecomp_recede(qctx, 7U);
+                    continue;
+                }
+                if (((title_opown>>2) & 0x3) == 0x3) {
+                    hostdecomp_recede(qctx, 1U);
+                    continue;
+                }
+
                 uint32_t mini_cqe_num = ((current_opown>>4) & 0xF) + 1U;
                 hostdecomp_decompress_current(qctx, (struct host_mini_cqe64 *) current_cqe, (struct host_cqe64 *) title_cqe, mini_cqe_num);
 
@@ -1475,11 +1533,9 @@ static void *hostdecomp_poll_thread(void *arg)
                 continue;
             }
 
-            if ((current_opown & 0x1) != qctx->cq_hw_owner_bit) {
                 hostdecomp_advance(qctx, 1);
                 scanned_cqe += 1;
                 continue;
-            }
 
             break;
         }
