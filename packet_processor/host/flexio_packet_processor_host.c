@@ -1402,76 +1402,76 @@ static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
 					 uint32_t mini_cqe_num
 					 )
 {
-    uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
-    uint32_t local_cq_idx = qctx->cq_idx;
-
-    uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *)title_cqe_ptr);
-    uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *)compressed_cqe_ptr);
-
-    uint8_t *dst = (uint8_t *) compressed_cqe_ptr;
-    
-    uint8_t current_opown = vgetq_lane_u8(title_cqe.val[3], 15);
-    uint8_t comp_last_byte = vgetq_lane_u8(compressed_cqe.val[3], 15);
-    title_cqe.val[3] = vsetq_lane_u8(comp_last_byte, title_cqe.val[3], 15);
-    vst1q_u8_x4(dst, title_cqe);
-    current_opown = (!(local_cq_idx & mask)) ? (current_opown ^ 0x1) : current_opown;
-    uint8_t last_write_byte = current_opown;
-    for (uint32_t i = 1; i < mini_cqe_num; i++) {
-        dst = dst + 64;
-        local_cq_idx++;
-        if (!(local_cq_idx & mask)) {
-            dst = dst - CQ_BSIZE;
-            current_opown = current_opown ^ 0x1;
-        }
-        title_cqe.val[3] = vsetq_lane_u8(current_opown, title_cqe.val[3], 15);
-        vst1q_u8_x4(dst, title_cqe);
-    }
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    *(((uint8_t *)compressed_cqe_ptr) + 63) = last_write_byte;
-    return 0;
-
-
     // uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
+    // uint32_t local_cq_idx = qctx->cq_idx;
 
-    // uint64_t mini_cqes[7] = {0};
-    // for (uint32_t i = 0; i < mini_cqe_num; i++) {
-        // mini_cqes[i] = compressed_cqe->mini_cqe[i];
+    // uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *)title_cqe_ptr);
+    // uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *)compressed_cqe_ptr);
+
+    // uint8_t *dst = (uint8_t *) compressed_cqe_ptr;
+    
+    // uint8_t current_opown = vgetq_lane_u8(title_cqe.val[3], 15);
+    // uint8_t comp_last_byte = vgetq_lane_u8(compressed_cqe.val[3], 15);
+    // title_cqe.val[3] = vsetq_lane_u8(comp_last_byte, title_cqe.val[3], 15);
+    // vst1q_u8_x4(dst, title_cqe);
+    // current_opown = (!(local_cq_idx & mask)) ? (current_opown ^ 0x1) : current_opown;
+    // uint8_t last_write_byte = current_opown;
+    // for (uint32_t i = 1; i < mini_cqe_num; i++) {
+        // dst = dst + 64;
+        // local_cq_idx++;
+        // if (!(local_cq_idx & mask)) {
+            // dst = dst - CQ_BSIZE;
+            // current_opown = current_opown ^ 0x1;
+        // }
+        // title_cqe.val[3] = vsetq_lane_u8(current_opown, title_cqe.val[3], 15);
+        // vst1q_u8_x4(dst, title_cqe);
     // }
+    // __atomic_thread_fence(__ATOMIC_RELEASE);
+    // *(((uint8_t *)compressed_cqe_ptr) + 63) = last_write_byte;
+    // return 0;
 
-    // struct host_cqe64 *current_cqe = NULL;
-    // uint8_t current_own_bit = (title_cqe->op_own & 0x1);
-    // { // i = 0
-        // current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        // current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
-    // }
-	// for (uint32_t i = 1; i < mini_cqe_num; i++) {
-        // current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx + i) & mask];
-        // current_own_bit = ((qctx->cq_idx + i) & mask) ? current_own_bit : !current_own_bit;
 
-        // memcpy(current_cqe, title_cqe, 64);
+    uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
 
-        // current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
-        // current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
-        // current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + i + 1U);
+    uint64_t mini_cqes[7] = {0};
+    for (uint32_t i = 0; i < mini_cqe_num; i++) {
+        mini_cqes[i] = compressed_cqe_ptr->mini_cqe[i];
+    }
 
-        // current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-	// }
-    // { // i = 0
-        // current_own_bit = (title_cqe->op_own & 0x1);
-        // current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        // current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
+    struct host_cqe64 *current_cqe = NULL;
+    uint8_t current_own_bit = (title_cqe_ptr->op_own & 0x1);
+    { // i = 0
+        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
+        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
+    }
+	for (uint32_t i = 1; i < mini_cqe_num; i++) {
+        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx + i) & mask];
+        current_own_bit = ((qctx->cq_idx + i) & mask) ? current_own_bit : !current_own_bit;
 
-        // memcpy(current_cqe, title_cqe, 63);
+        memcpy(current_cqe, title_cqe_ptr, 64);
 
-        // current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
-        // current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
-        // current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + 1U);
+        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
+        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
+        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe_ptr->wqe_counter) + i + 1U);
 
-        // __atomic_thread_fence(__ATOMIC_RELEASE);
-        // current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-    // }
+        current_cqe->op_own = (title_cqe_ptr->op_own & (~0x01)) | (current_own_bit & 0x01);
+	}
+    { // i = 0
+        current_own_bit = (title_cqe_ptr->op_own & 0x1);
+        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
+        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
 
-	// return 0;
+        memcpy(current_cqe, title_cqe_ptr, 63);
+
+        current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
+        current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
+        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe_ptr->wqe_counter) + 1U);
+
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        current_cqe->op_own = (title_cqe_ptr->op_own & (~0x01)) | (current_own_bit & 0x01);
+    }
+
+	return 0;
 }
 
 /* Host observer thread: rotates across all DPA threads' host-memory CQ rings.

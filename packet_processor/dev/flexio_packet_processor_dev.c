@@ -426,6 +426,11 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     #ifdef HOSTCQ
     __dpa_thread_window_read_inv();
     #endif
+    for(int i = -4; i < 4; i++) {
+        struct flexio_dev_cqe64 *cur = &(ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx + i) & CQ_IDX_MASK]); (void) cur;
+        
+        // if(ctx->thread_index < 4) flexio_dev_print("%d: vic %02x, opown %02x\n", i, cur->validity_iteration_count, cur->op_own);
+    }
     __dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
     dbr_rq_inc_pi_value_with_one_padding(&ctx->rq_ctx, (uint32_t) (ctx->packets_count - last_doorbelled_packet_count));
     update_data_from_host_report(data_from_host, ctx);
