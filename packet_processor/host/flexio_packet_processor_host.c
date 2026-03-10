@@ -1509,25 +1509,40 @@ back:
 }
 
 static int hostdecomp_work(uint8_t *cqe) {
+
     uint8_t *scanning_cqe = cqe;
     int scanned_cqe = 0;
 
-    int ret = hostdecomp_decompress(scanning_cqe);
-    scanned_cqe += ret;
+    int ret = 0;
+    uint8_t prev_opown = 0;
+    uint8_t sw_ownership = 0;
 
-    scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, ret - 1);
-    uint8_t prev_opown = *(scanning_cqe + 63);
+    goto decomp;
 
-    while (scanned_cqe < Q_DEPTH) {
+    while ((uint64_t)scanned_cqe < Q_DEPTH) {
         scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, 1);
         uint8_t scanning_opown = *(scanning_cqe + 63);
+        if (!((uint64_t)scanning_cqe & (CQ_BSIZE-1))) sw_ownership = !sw_ownership;
 
-        if ((scanning_opown & 0x0C))
+        if ((scanning_opown & 0x0C) == 0x0C) {
+        decomp:
+            ret = hostdecomp_decompress(scanning_cqe);
+            scanned_cqe += ret;
+            scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, ret - 1);
+            prev_opown = *(scanning_cqe + 63);
+            sw_ownership = prev_opown & 0x1; // maybe this can be dangerous if dpa is too fast.
+            continue;
+        }
 
+        if ((scanning_opown & 0x01) == sw_ownership) {
+            scanned_cqe += 1;
+            prev_opown = scanning_opown;
+            continue;
+        }
 
-
-        prev_opown = scanning_opown;
+        return 0;
     }
+    return 0;
 }
 /* Decompress a compressed CQE block in-place in host memory.
  * Mirrors the DPA-side decompress_if_cqe_is_compressed logic but runs on host CPU.
@@ -1666,7 +1681,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+0]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 0);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                hostdecomp_work((uint8_t *) dpa_memo_content);
                 cpu_memo_addr->memo[(block_idx<<3)+0] = dpa_memo_indicator;
             }
 
@@ -1675,7 +1690,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+1]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 1);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                hostdecomp_work((uint8_t *) dpa_memo_content);
                 cpu_memo_addr->memo[(block_idx<<3)+1] = dpa_memo_indicator;
             }
 
@@ -1684,7 +1699,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+2]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 0);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                hostdecomp_work((uint8_t *) dpa_memo_content);
                 cpu_memo_addr->memo[(block_idx<<3)+2] = dpa_memo_indicator;
             }
 
@@ -1693,7 +1708,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+3]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 1);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                hostdecomp_work((uint8_t *) dpa_memo_content);
                 cpu_memo_addr->memo[(block_idx<<3)+3] = dpa_memo_indicator;
             }
 
@@ -1702,7 +1717,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+4]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 0);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                hostdecomp_work((uint8_t *) dpa_memo_content);
                 cpu_memo_addr->memo[(block_idx<<3)+4] = dpa_memo_indicator;
             }
 
@@ -1711,7 +1726,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+5]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 1);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                hostdecomp_work((uint8_t *) dpa_memo_content);
                 cpu_memo_addr->memo[(block_idx<<3)+5] = dpa_memo_indicator;
             }
 
@@ -1720,7 +1735,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+6]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 0);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
+                hostdecomp_work((uint8_t *) dpa_memo_content);
                 cpu_memo_addr->memo[(block_idx<<3)+6] = dpa_memo_indicator;
             }
 
@@ -1729,8 +1744,7 @@ static void *hostdecomp_poll_thread(void *arg)
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+7]) {
                 dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 1);
                 dpa_memo_content &= ~0x1ULL;
-                hostdecomp_decompress((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+7] = dpa_memo_indicator;
+                hostdecomp_work((uint8_t *) dpa_memo_content); cpu_memo_addr->memo[(block_idx<<3)+7] = dpa_memo_indicator;
             }
 
 
