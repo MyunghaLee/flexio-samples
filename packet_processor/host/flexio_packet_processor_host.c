@@ -1554,15 +1554,15 @@ static void *hostdecomp_poll_thread(void *arg)
         if ((memo_content & 0x1) != qctx->waiting_indicator) {
             continue;
         }
-
         qctx->waiting_indicator = !qctx->waiting_indicator;
-        const uint8_t *compressed_cqe_ptr = (const uint8_t *)(memo_content & 0xFFFFFFFFFFFFFFC0ULL);
-        uint8_t compressed_is_first = (memo_content & 0x2);
-        const uint8_t *title_cqe_ptr = (const uint8_t *) (compressed_is_first ? compressed_cqe_ptr + CQ_BSIZE - 64 : compressed_cqe_ptr - 64);
 
+        uint8_t *compressed_cqe_ptr = (uint8_t *)(memo_content & 0xFFFFFFFFFFFFFFC0ULL);
+        uint8_t compressed_is_first = (memo_content & 0x2);
+        uint8_t *title_cqe_ptr = (uint8_t *) (compressed_is_first ? compressed_cqe_ptr + CQ_BSIZE - 64 : compressed_cqe_ptr - 64);
         uint32_t mini_cqe_num = (memo_content>>2) & 0xF; //0~6
-        uint8x16x4_t compressed_cqe = vld1q_u8_x4(compressed_cqe_ptr);
-        uint8x16x4_t title_cqe = vld1q_u8_x4(title_cqe_ptr);
+
+        uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *)title_cqe_ptr);
+        uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *)compressed_cqe_ptr);
 
         uint8_t *dst = (uint8_t *) compressed_cqe_ptr;
         
