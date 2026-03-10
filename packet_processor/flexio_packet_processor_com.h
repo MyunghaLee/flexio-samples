@@ -80,6 +80,10 @@ struct app_transfer_wq {
 	flexio_uintptr_t wqd_daddr;
 } __attribute__((__packed__, aligned(8)));
 
+struct hostdecomp_thread_memo {
+    uint16_t memo[192];
+}  __attribute__((__packed__, aligned(64))) ;
+
 /* Collateral structure for transfer host data to device */
 struct host2dev_packet_processor_data {
 	/* RQ's CQ transfer information. */
@@ -90,13 +94,14 @@ struct host2dev_packet_processor_data {
 	struct app_transfer_cq sq_cq_transf;
 	/* SQ transfer information. */
 	struct app_transfer_wq sq_transf;
+    flexio_uintptr_t thread_memo;
     uint64_t report_packets_count;
     uint64_t report_comp_packets_count; // until here 128B
 	uint32_t thread_index;   /* Index into device-side app_ctxs[] */
 	uint32_t window_id;      /* FlexIO window ID for DPA→host memory access */
     uint16_t heartbeat;
 	uint8_t  not_first_run;
-    uint8_t  rsvd[53];
+    uint8_t  rsvd[45];
 } __attribute__((__packed__, aligned(64)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */

@@ -85,7 +85,10 @@ struct app_device_ctx {
 	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
 	uint32_t window_id;          /* FlexIO window ID */
 
-    uint8_t rsvd[36];
+    uint8_t rsvd[16];
+    uint32_t test;
+    flexio_uintptr_t thread_memo_haddr;
+    struct hostdecomp_thread_memo *thread_memo;
 } __attribute__((__packed__, aligned(64)));
 
 /* Static array of per-thread contexts. Each event handler is pinned to a dedicated EU,
@@ -139,6 +142,8 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 	 */
     ctx->rqcq_haddr_base = data_from_host->rq_cq_transf.cq_ring_daddr;
     #endif
+
+    ctx->thread_memo_haddr = data_from_host->thread_memo;
 
 	/* Set context for RQ's CQ.
 	 * When hostcq: pass 0 for cq_ring_daddr — it is set to the window-mapped
@@ -326,6 +331,36 @@ static void update_data_from_host_report(struct host2dev_packet_processor_data *
     data_from_host->heartbeat++;
 }
 
+static void print_full_cqe64(struct flexio_dev_cqe64 *cqe)
+{
+	flexio_dev_print("CQE64 dump begin\n");
+	flexio_dev_print("  rsvd00[0]=0x%08x rsvd00[1]=0x%08x rsvd00[2]=0x%08x rsvd00[3]=0x%08x rsvd00[4]=0x%08x\n",
+			 be32_to_cpu(cqe->rsvd00[0]), be32_to_cpu(cqe->rsvd00[1]),
+			 be32_to_cpu(cqe->rsvd00[2]), be32_to_cpu(cqe->rsvd00[3]),
+			 be32_to_cpu(cqe->rsvd00[4]));
+	flexio_dev_print("  csum_ok=0x%04x rsvd22[0]=0x%02x rsvd22[1]=0x%02x\n",
+			 be16_to_cpu(cqe->csum_ok), cqe->rsvd22[0], cqe->rsvd22[1]);
+	flexio_dev_print("  rsvd24[0]=0x%08x rsvd24[1]=0x%08x\n",
+			 be32_to_cpu(cqe->rsvd24[0]), be32_to_cpu(cqe->rsvd24[1]));
+	flexio_dev_print("  srqn_uidx=0x%08x imm_inval_pkey=0x%08x\n",
+			 be32_to_cpu(cqe->srqn_uidx), be32_to_cpu(cqe->imm_inval_pkey));
+	flexio_dev_print("  rsvd40=0x%08x byte_cnt=%u rsvd48=0x%08x\n",
+			 be32_to_cpu(cqe->rsvd40), be32_to_cpu(cqe->byte_cnt),
+			 be32_to_cpu(cqe->rsvd48));
+	flexio_dev_print("  hw_err_syndrome=0x%02x rsvd50=0x%02x vendor_err_synd=0x%02x syndrome=0x%02x\n",
+			 cqe->hw_err_syndrome, cqe->rsvd50, cqe->vendor_err_synd, cqe->syndrome);
+	flexio_dev_print("  sop_rdrop=0x%02x qpn24=[0x%02x 0x%02x 0x%02x] qpn=0x%08x\n",
+			 cqe->sop_rdrop, cqe->qpn24[0], cqe->qpn24[1], cqe->qpn24[2],
+			 be32_to_cpu(cqe->qpn));
+	flexio_dev_print("  wqe_counter=%u signature=0x%02x validity_iteration_count=0x%02x\n",
+			 be16_to_cpu(cqe->wqe_counter), cqe->signature,
+			 cqe->validity_iteration_count);
+	flexio_dev_print("  op_own=0x%02x (owner=%u opcode=%u type=%u)\n",
+			 cqe->op_own, flexio_dev_cqe_get_owner(cqe),
+			 flexio_dev_cqe_get_opcode(cqe), flexio_dev_cqe_get_type(cqe));
+	flexio_dev_print("CQE64 dump end\n");
+}
+
 /* Entry point function that host side calls for execution.
  *  thread_arg - pointer to the host2dev_packet_processor_data structure
  *     to transfer data from the host side.
@@ -333,6 +368,7 @@ static void update_data_from_host_report(struct host2dev_packet_processor_data *
 flexio_dev_event_handler_t flexio_pp_dev;
 __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 {
+    (void) print_full_cqe64;
 	struct host2dev_packet_processor_data *data_from_host = (void *)thread_arg;
 	struct app_device_ctx *ctx;
 
@@ -377,6 +413,11 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         (combined_dpa_base + (ctx->rqcq_haddr_base - ctx->rqd_haddr_base));
     ctx->rq_cq_ctx.cqe = &ctx->rq_cq_ctx.cq_ring[ctx->rq_cq_ctx.cq_idx & mask];
     #endif
+
+    #if CQE_COMP==2
+    ctx->thread_memo = (struct hostdecomp_thread_memo *)(uintptr_t)
+        (combined_dpa_base + ((uint64_t)ctx->thread_memo_haddr - ctx->rqd_haddr_base));
+    #endif
     #endif
 
     uint64_t last_packet_count = ctx->packets_count;
@@ -401,12 +442,32 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         }
         #elif CQE_COMP==2
         if (((current_op_own>>2) & 0x3) == 0x3) {
+            {
+            ctx->test++;
+            if (ctx->thread_index < 4) {
+                if (ctx->test > (1000000 * (ctx->thread_index + 1U))) {
+                    flexio_dev_print("----------------------------------------\n");
+                    flexio_dev_print("tid=%u, cqidx=%u, hw=%u, cqe=%lx\n", ctx->thread_index, ctx->rq_cq_ctx.cq_idx, ctx->rq_cq_ctx.cq_hw_owner_bit, (uint64_t)ctx->rq_cq_ctx.cqe);
+                    for(uint32_t i = 0; i < 8; i++) {
+                        print_full_cqe64(&ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4U + i) & CQ_IDX_MASK]);
+                    }
+                    flexio_dev_thread_reschedule();
+                    return;
+                }
+            }
+            }
+            volatile uint16_t *thread_memo_dst = (volatile uint16_t *) &ctx->thread_memo->memo[ctx->thread_index];
+            *thread_memo_dst = (uint16_t) (ctx->rq_cq_ctx.cq_idx & CQ_IDX_MASK) | ((((uint32_t) ctx->rq_cq_ctx.cq_hw_owner_bit) << 15));
+            // __dpa_thread_system_fence();
+            __dpa_thread_window_writeback();
             __dpa_thread_window_read_inv();
+            // __dpa_thread_system_fence();
             continue;
         }
         #endif
 
         if (likely(((current_op_own) & 0x1) != ctx->rq_cq_ctx.cq_hw_owner_bit)) {
+            ctx->test = 0;
             ctx->packets_count++;
             #ifndef RXONLY
             process_packet(ctx);
@@ -429,6 +490,24 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 
         break;
 	}
+    {
+    #if CQE_COMP==2
+    ctx->test++;
+    if (ctx->thread_index < 4) {
+        // flexio_dev_print("test=%u\n", ctx->test);
+        if (ctx->test > (100000 * (ctx->thread_index + 1U))) {
+            // flexio_dev_print("----------------------------------------\n");
+            // flexio_dev_print("tid=%u, cqidx=%u, hw=%u, cqe=%lx\n", ctx->thread_index, ctx->rq_cq_ctx.cq_idx, ctx->rq_cq_ctx.cq_hw_owner_bit, (uint64_t)ctx->rq_cq_ctx.cqe);
+            for(uint32_t i = 0; i < 8; i++) {
+                // print_full_cqe64(&ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4U + i) & CQ_IDX_MASK]);
+            }
+            // flexio_dev_thread_reschedule();
+            // return;
+        }
+    }
+    #endif
+    }
+
     #ifdef HOSTCQ
     __dpa_thread_window_read_inv();
     #endif
