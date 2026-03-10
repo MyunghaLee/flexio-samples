@@ -85,10 +85,12 @@ struct app_device_ctx {
 	/* Host buffer mode fields (only meaningful when hostbuf_enabled == 1) */
 	uint32_t window_id;          /* FlexIO window ID */
 
-    uint8_t rsvd[16];
     uint32_t test;
+    uint8_t rsvd[14];
+    uint8_t wrote_to_host;
+    uint8_t indicator_to_host;
     flexio_uintptr_t thread_memo_haddr;
-    struct hostdecomp_thread_memo *thread_memo;
+    volatile uint64_t *thread_memo;
 } __attribute__((__packed__, aligned(64)));
 
 /* Static array of per-thread contexts. Each event handler is pinned to a dedicated EU,
@@ -415,7 +417,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     #endif
 
     #if CQE_COMP==2
-    ctx->thread_memo = (struct hostdecomp_thread_memo *)(uintptr_t)
+    ctx->thread_memo = (volatile uint64_t *)(uintptr_t)
         (combined_dpa_base + ((uint64_t)ctx->thread_memo_haddr - ctx->rqd_haddr_base));
     #endif
     #endif
@@ -456,18 +458,22 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
                 }
             }
             }
-            volatile uint16_t *thread_memo_dst = (volatile uint16_t *) &ctx->thread_memo->memo[ctx->thread_index];
-            *thread_memo_dst = (uint16_t) (ctx->rq_cq_ctx.cq_idx & CQ_IDX_MASK) | ((((uint32_t) ctx->rq_cq_ctx.cq_hw_owner_bit) << 15));
-            // __dpa_thread_system_fence();
-            __dpa_thread_window_writeback();
+            if (!ctx->wrote_to_host) {
+                ctx->wrote_to_host = 1;
+                ctx->indicator_to_host = !ctx->indicator_to_host;
+                *ctx->thread_memo = ((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + ctx->rqd_haddr_base)
+                                | (uint64_t)(((current_op_own>>2)&0x3c) | ((uint8_t)((ctx->rq_cq_ctx.cq_idx & CQ_IDX_MASK)==0)<<1) | ctx->indicator_to_host);
+                __dpa_thread_window_writeback();
+            }
             __dpa_thread_window_read_inv();
-            // __dpa_thread_system_fence();
             continue;
         }
         #endif
 
         if (likely(((current_op_own) & 0x1) != ctx->rq_cq_ctx.cq_hw_owner_bit)) {
-            ctx->test = 0;
+            #if CQE_COMP==2
+            ctx->wrote_to_host = 0;
+            #endif
             ctx->packets_count++;
             #ifndef RXONLY
             process_packet(ctx);

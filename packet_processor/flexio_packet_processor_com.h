@@ -80,10 +80,6 @@ struct app_transfer_wq {
 	flexio_uintptr_t wqd_daddr;
 } __attribute__((__packed__, aligned(8)));
 
-struct hostdecomp_thread_memo {
-    uint16_t memo[192];
-}  __attribute__((__packed__, aligned(64))) ;
-
 /* Collateral structure for transfer host data to device */
 struct host2dev_packet_processor_data {
 	/* RQ's CQ transfer information. */
