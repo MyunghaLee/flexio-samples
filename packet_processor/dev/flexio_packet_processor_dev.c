@@ -370,6 +370,19 @@ static void print_full_cqe64(struct flexio_dev_cqe64 *cqe)
 	flexio_dev_print("CQE64 dump end\n");
 }
 
+#if CQE_COMP==2
+static void cqe_ptr_notification(struct app_device_ctx *ctx, flexio_uintptr_t combined_dpa_base) {
+    uint32_t cl_base = ctx->thread_index & ~7U;
+    volatile intptr_t *host_dst = (volatile intptr_t *)(uintptr_t)
+        (combined_dpa_base
+            + (uint64_t)ctx->thread_memo_haddr - (uint64_t)ctx->rqd_haddr_base
+            + (uint64_t)cl_base * sizeof(intptr_t));
+    for (uint32_t i = 0; i < 8; i++)
+        host_dst[i] = dpa_local_thread_memo[cl_base + i];
+    __dpa_thread_window_writeback();
+}
+#endif
+
 /* Entry point function that host side calls for execution.
  *  thread_arg - pointer to the host2dev_packet_processor_data structure
  *     to transfer data from the host side.
@@ -455,14 +468,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 
                 /* Every 8th thread flushes the 64B cache line (8 entries) to host memory */
                 if ((ctx->thread_index & 7) == 7) {
-                    uint32_t cl_base = ctx->thread_index & ~7U;
-                    volatile intptr_t *host_dst = (volatile intptr_t *)(uintptr_t)
-                        (combined_dpa_base
-                         + (uint64_t)ctx->thread_memo_haddr - (uint64_t)ctx->rqd_haddr_base
-                         + (uint64_t)cl_base * sizeof(intptr_t));
-                    for (uint32_t i = 0; i < 8; i++)
-                        host_dst[i] = dpa_local_thread_memo[cl_base + i];
-                    __dpa_thread_window_writeback();
+                    cqe_ptr_notification(ctx, combined_dpa_base);
                 }
 
                 ctx->indicator_for_host = !ctx->indicator_for_host;
