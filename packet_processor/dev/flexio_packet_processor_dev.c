@@ -1,4 +1,4 @@
-/*
+t/*
  * SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES.
  * Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -86,7 +86,9 @@ struct app_device_ctx {
 	uint32_t window_id;          /* FlexIO window ID */
 
     uint32_t test;
-    uint8_t rsvd[22];
+    uint16_t rand;
+    uint8_t rsvd[19];
+    uint8_t notified_for_host;
     uint8_t wrote_for_host;
     uint8_t indicator_for_host;
     flexio_uintptr_t thread_memo_haddr;
@@ -101,7 +103,7 @@ static struct app_device_ctx app_ctxs[APP_MAX_DPA_THREADS];
  * Sized to 192 = ceil(190/8)*8 so every 8-entry group is a full 64B cache line.
  * Only every 8th thread flushes its group's cache line to host memory.
  */
-static intptr_t dpa_local_thread_memo[192] __attribute__((aligned(64)));
+static volatile intptr_t dpa_local_thread_memo[192] __attribute__((aligned(64)));
 
 FLEXIO_DEV_ALWAYS_INLINE flexio_dev_status_t flexio_dev_dbr_rq_inc_pi_value(uint32_t *rq_dbr, uint32_t value)
 {
@@ -150,6 +152,7 @@ static void app_ctx_init(struct app_device_ctx *ctx,
     ctx->rqcq_haddr_base = data_from_host->rq_cq_transf.cq_ring_daddr;
     #endif
 
+    ctx->rand = (uint16_t)((ctx->rqcq_haddr_base>>6) & 0xFFFF);
     ctx->wrote_for_host = 0;
     ctx->indicator_for_host = 1;
     ctx->thread_memo_haddr = data_from_host->thread_memo;
@@ -381,6 +384,21 @@ static void cqe_ptr_notification(struct app_device_ctx *ctx, flexio_uintptr_t co
         host_dst[i] = dpa_local_thread_memo[cl_base + i];
     __dpa_thread_window_writeback();
 }
+
+static void rand_update(struct app_device_ctx *ctx) {
+    // 1. 만약 rand가 0이면 특정 값(0xACE1)으로 강제 초기화 (0 탈출)
+    // 이 부분 역시 브랜치리스로 처리: 0일 때만 비트가 모두 1인 마스크 생성
+    ctx->rand |= (uint16_t)(-(ctx->rand == 0)) & 0xACE1U;
+
+    // 2. LSB 추출 및 시프트
+    uint16_t lsb = ctx->rand & 0x1;
+    ctx->rand >>= 1;
+
+    // 3. 브랜치리스 탭 적용
+    // lsb가 1이면 mask는 0xFFFF, 0이면 mask는 0x0000이 됩니다.
+    uint16_t mask = (uint16_t)(-(int16_t)lsb);
+    ctx->rand ^= (mask & 0xB400U);
+}
 #endif
 
 /* Entry point function that host side calls for execution.
@@ -443,9 +461,18 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
 	/* Poll CQ until the package is received. */
+    (void) rand_update;
+    (void) cqe_ptr_notification;
 	while (1) {
         volatile uint8_t *current_op_own_ptr = (volatile uint8_t *) &ctx->rq_cq_ctx.cqe->op_own;
         uint8_t current_op_own = *current_op_own_ptr;
+
+        if (((ctx->thread_index & 0x7) == 0x7)) {
+            rand_update(ctx);  uint32_t rand_idx = (ctx->rand & 0x1f);
+            if ((rand_idx) == 0x0U) {
+                // cqe_ptr_notification(ctx, combined_dpa_base);
+            }
+        }
 
         #ifdef HOSTCQ
         __dpa_thread_outbox_fence(__DPA_R, __DPA_R);
@@ -465,21 +492,48 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
                 intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
                 /* Write to DPA-local memo — no PCIe */
                 dpa_local_thread_memo[ctx->thread_index] = val;
-
-                /* Every 8th thread flushes the 64B cache line (8 entries) to host memory */
-                if ((ctx->thread_index & 7) == 7) {
-                    cqe_ptr_notification(ctx, combined_dpa_base);
-                }
-
                 ctx->indicator_for_host = !ctx->indicator_for_host;
+
+                volatile intptr_t *host_dst = (volatile intptr_t *)(uintptr_t)
+                    (combined_dpa_base
+                        + (uint64_t)ctx->thread_memo_haddr - (uint64_t)ctx->rqd_haddr_base
+                        + (uint64_t)ctx->thread_index * sizeof(intptr_t));
+                *host_dst = val;
+                // if ((ctx->thread_index & 0x7) == 0x7) cqe_ptr_notification(ctx, combined_dpa_base);
             }
+            // else {
+                // intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)!ctx->indicator_for_host);
+                // dpa_local_thread_memo[ctx->thread_index] = val;
+            // }
+
+
+
+            // rand_update(ctx);  uint32_t rand_idx = (ctx->rand & 0x7);
+            // if ((rand_idx) == 0x0U) {
+                // intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)!ctx->indicator_for_host);
+                // dpa_local_thread_memo[ctx->thread_index] = val;
+                // cqe_ptr_notification(ctx, combined_dpa_base);
+            // }
+
+        // if ((ctx->thread_index & 0x7) == 0x7) {
+            // rand_update(ctx);
+            // uint32_t rand_idx = (ctx->rand & 0x3f);
+            // if ((rand_idx) == 0x0U) {
+                // cqe_ptr_notification(ctx, combined_dpa_base);
+            // }
+        // }
+
+
+
             __dpa_thread_window_read_inv();
             continue;
         }
         #endif
 
         if (likely(((current_op_own) & 0x1) != ctx->rq_cq_ctx.cq_hw_owner_bit)) {
+            // if (ctx->notified_for_host) cqe_ptr_notification(ctx, combined_dpa_base);
             ctx->wrote_for_host = 0;
+            ctx->notified_for_host = 0;
             ctx->packets_count++;
             #ifndef RXONLY
             process_packet(ctx);
