@@ -84,7 +84,7 @@ struct hostdecomp_thread_memo {
     intptr_t memo[192];
 }  __attribute__((__packed__, aligned(64))) ;
 struct hostdecomp_cpu_memo {
-    uint8_t memo[192];
+    uint8_t memo[192/8];
 }  __attribute__((__packed__, aligned(64))) ;
 
 /* Collateral structure for transfer host data to device */

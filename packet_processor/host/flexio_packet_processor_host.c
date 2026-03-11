@@ -481,8 +481,10 @@ static int rq_cq_mem_alloc_host(struct app_context *app_ctx, struct thread_ctx *
 
 	/* Initialize CQEs: zero-fill then set owner bit = 1 (HW-owned initial state). */
 	memset(cq_ring_ptr, 0, CQ_BSIZE);
-	for (i = 0, cqe_p = (struct mlx5_cqe64 *)cq_ring_ptr; i < Q_DEPTH; i++)
+	for (i = 0, cqe_p = (struct mlx5_cqe64 *)cq_ring_ptr; i < Q_DEPTH; i++) {
+        cqe_p->signature = 0xFF;
 		mlx5dv_set_cqe_owner(cqe_p++, 1);
+    }
 
 	/* Register a DEVX UMEM covering just the CQ ring portion.
 	 * humem_offset = 0 because this UMEM starts at the CQ ring start address.
@@ -1464,12 +1466,25 @@ static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
     (((uintptr_t)(cqe) + CQE_BSIZE) & ((uintptr_t)CQ_BSIZE - 1)) \
 )
 
+#define CQE_BEFORE_VALUE(cqe, val) ( \
+    ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
+    (((uintptr_t)(cqe) - (CQE_BSIZE * (val))) & ((uintptr_t)CQ_BSIZE - 1)) \
+)
+
 #define CQE_AFTER_VALUE(cqe, val) ( \
     ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
     (((uintptr_t)(cqe) + (CQE_BSIZE * (val))) & ((uintptr_t)CQ_BSIZE - 1)) \
 )
 
-static int hostdecomp_decompress(uint8_t *cqe) {
+#define WAS_A_FLIP(cqe, val) ( \
+    CQE_BEFORE_VALUE(cqe, val) > ((uintptr_t)cqe) \
+)
+
+#define WILLBE_A_FLIP(cqe, val) ( \
+    CQE_AFTER_VALUE(cqe, val) < ((uintptr_t)cqe) \
+)
+
+static int hostdecomp_decompress(uintptr_t cqe) {
     int ret = 0;
     uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *)CQE_BEFORE(cqe));
     uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *)(cqe)); (void) compressed_cqe;
@@ -1477,7 +1492,7 @@ static int hostdecomp_decompress(uint8_t *cqe) {
 
     uint32_t mini_cqe_num = (uint32_t)(compressed_opown>>4) + 1U;
 
-    uint8_t *dst = cqe;
+    uint8_t *dst = (uint8_t *) cqe;
     uint8_t dst_opown = vgetq_lane_u8(title_cqe.val[3], 15);
 
     if (!((uint64_t)dst & (CQ_BSIZE-1))) dst_opown ^= 0x1;
@@ -1496,7 +1511,7 @@ back:
     volatile uint8_t *new_opown_ptr = (volatile uint8_t *) (dst + 63);
     uint8_t new_opown = *new_opown_ptr;
 
-    if ((new_opown & 0x0C) == 0x0C && dst != cqe) {
+    if ((new_opown & 0x0C) == 0x0C && dst != (uint8_t *)cqe) {
         compressed_cqe = vld1q_u8_x4((const uint8_t *)(dst));
         mini_cqe_num = (uint32_t) (new_opown >> 4) + 1U;
 
@@ -1504,43 +1519,71 @@ back:
     }
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    *(cqe + 63) = last_write_byte;
+    *((uint8_t *)cqe + 63) = last_write_byte;
     return ret;
 }
 
-static int hostdecomp_work(uint8_t *cqe) {
+static uint16_t hostdecomp_get_vic_opown(uintptr_t cqe) {
+    volatile uint16_t *vic_opown_ptr = (volatile uint16_t *) (cqe + 62);
+    return *vic_opown_ptr;
+}
 
-    uint8_t *scanning_cqe = cqe;
+static int hostdecomp_work(uintptr_t cqe) {
+    uintptr_t scanning_cqe = cqe;
     int scanned_cqe = 0;
 
-    int ret = 0;
-    uint8_t prev_opown = 0;
-    uint8_t sw_ownership = 0;
-
-    goto decomp;
-
     while ((uint64_t)scanned_cqe < Q_DEPTH) {
-        scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, 1);
-        uint8_t scanning_opown = *(scanning_cqe + 63);
-        if (!((uint64_t)scanning_cqe & (CQ_BSIZE-1))) sw_ownership = !sw_ownership;
+        uint16_t scanning_vic_opown = hostdecomp_get_vic_opown(scanning_cqe);
+        uint8_t scanning_opown = (uint8_t) ((scanning_vic_opown & 0xFF00)>>8);
+        uint8_t scanning_vic = (uint8_t) (scanning_vic_opown & 0xFF);
+        uint8_t scanning_mini_cqe_num = (scanning_opown >> 4) + 1U;
+        uint8_t is_scanning_mini_cqe_block = (scanning_opown & 0x0C) == 0x0C;
 
-        if ((scanning_opown & 0x0C) == 0x0C) {
-        decomp:
-            ret = hostdecomp_decompress(scanning_cqe);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+
+        uint8_t is_jump_between_prevcqe_and_scanning = (uint8_t) WAS_A_FLIP(scanning_cqe, 1);
+        uint16_t prevcqe_vic_opown = hostdecomp_get_vic_opown(CQE_BEFORE(scanning_cqe));
+        uint8_t prevcqe_opown = (uint8_t) ((prevcqe_vic_opown & 0xFF00)>>8);
+        uint8_t prevcqe_vic = (uint8_t) (prevcqe_vic_opown & 0xFF);
+        prevcqe_vic += is_jump_between_prevcqe_and_scanning;
+        uint8_t prevcqe_mini_cqe_num = (prevcqe_opown >> 4) + 1U;
+        uint8_t is_prevcqe_mini_cqe_block = (prevcqe_opown & 0x0C) == 0x0C;
+
+        uint8_t vic_diff = scanning_vic - prevcqe_vic;
+
+        // assumes that mini_cqe_num 1 block is not followed by another mini cqe block.
+        if (vic_diff == 1) {
+            scanning_cqe = CQE_BEFORE_VALUE(scanning_cqe, 7);
+            scanned_cqe = 0;
+            continue;
+        }
+        else if (vic_diff == (uint8_t)-1) {
+            if (is_prevcqe_mini_cqe_block && (prevcqe_mini_cqe_num > 1U)) {
+                scanning_cqe = CQE_BEFORE(scanning_cqe);
+                scanned_cqe = 0;
+                continue;
+            }
+        }
+        else if (is_scanning_mini_cqe_block && (scanning_mini_cqe_num > 1U)) {
+            if (is_prevcqe_mini_cqe_block) break;
+            // printf("-------------------------------------------------------\n");
+            // printf("here! ptr = %lx\n", (uint64_t)scanning_cqe);
+            // for (int i = 0; i < 128; i++) {
+                // printf("%04x\n", *(volatile uint16_t *)(CQE_AFTER_VALUE((CQE_BEFORE_VALUE(scanning_cqe, 4)), i) + 62));
+            // }
+            int ret = hostdecomp_decompress(scanning_cqe);
+            // printf("here! ptr = %lx\n", (uint64_t)scanning_cqe);
+            // for (int i = 0; i < 128; i++) {
+                // printf("%04x\n", *(volatile uint16_t *)(CQE_AFTER_VALUE((CQE_BEFORE_VALUE(scanning_cqe, 4)), i) + 62));
+            // }
+            scanning_cqe = CQE_AFTER_VALUE(scanning_cqe, ret);
             scanned_cqe += ret;
-            scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, ret - 1);
-            prev_opown = *(scanning_cqe + 63);
-            sw_ownership = prev_opown & 0x1; // maybe this can be dangerous if dpa is too fast.
             continue;
         }
 
-        if ((scanning_opown & 0x01) == sw_ownership) {
-            scanned_cqe += 1;
-            prev_opown = scanning_opown;
-            continue;
-        }
-
-        return 0;
+        scanning_cqe = CQE_AFTER_VALUE(scanning_cqe, 2);
+        scanned_cqe += 2;
+        continue;
     }
     return 0;
 }
@@ -1548,57 +1591,6 @@ static int hostdecomp_work(uint8_t *cqe) {
  * Mirrors the DPA-side decompress_if_cqe_is_compressed logic but runs on host CPU.
  * Returns 0 on success, -1 if no title CQE is available.
  */
-static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
-					 const struct host_mini_cqe64 *compressed_cqe,
-                     struct host_cqe64 *title_cqe,
-					 uint32_t mini_cqe_num
-					 )
-{
-    uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
-
-    uint64_t mini_cqes[7] = {0};
-    for (uint32_t i = 0; i < mini_cqe_num; i++) {
-        mini_cqes[i] = compressed_cqe->mini_cqe[i];
-    }
-
-    struct host_cqe64 *current_cqe = NULL;
-    uint8_t current_own_bit = (title_cqe->op_own & 0x1);
-    { // i = 0
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
-    }
-	for (uint32_t i = 1; i < mini_cqe_num; i++) {
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx + i) & mask];
-        current_own_bit = ((qctx->cq_idx + i) & mask) ? current_own_bit : !current_own_bit;
-
-        memcpy(current_cqe, title_cqe, 64);
-
-        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
-        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + i + 1U);
-        current_cqe->rsvd24[0] = (__be32) htobe32(i);
-
-        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-	}
-    { // i = 0
-        current_own_bit = (title_cqe->op_own & 0x1);
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
-
-        memcpy(current_cqe, title_cqe, 63);
-
-        current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
-        current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + 1U);
-        current_cqe->rsvd24[0] = (__be32) htobe32(0xDEADBEEF);
-
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-    }
-        title_cqe->rsvd24[0] = (__be32) htobe32(0xEEEEEEEE);
-
-	return 0;
-}
 
 void print_uint8x16x4(uint8x16x4_t d);
 void print_uint8x16x4(uint8x16x4_t d) {
@@ -1642,7 +1634,6 @@ static void *hostdecomp_poll_thread(void *arg)
 {
     (void) print_uint8x16x4;
     (void) print_memoblock;
-    (void) hostdecomp_decompress_current;
     (void) hostdecomp_advance;
     (void) hostdecomp_entry_addr;
     (void) hostdecomp_work;
@@ -1669,130 +1660,79 @@ static void *hostdecomp_poll_thread(void *arg)
 
 	while (!ctx->stop) {
         for (uint32_t block_idx = 0; block_idx < dpa_memo_block_count; block_idx++) {
-            uintptr_t dpa_memo_block_addr = (uintptr_t) &dpa_memo_addr->memo[(block_idx<<3)];
-            uint8x16x4_t dpa_memo_block = vld1q_u8_x4((const uint8_t *) dpa_memo_block_addr);
-            uint8_t dpa_memo_indicator;
+            // sleep(1);
+            // check for indicator
+            volatile uint8_t *dpa_memo_indicator_addr = (volatile uint8_t *) &dpa_memo_addr->memo[(block_idx<<3)];
+            uint8_t dpa_memo_indicator = *dpa_memo_indicator_addr;
+            // printf("-----memo = %x-----\n", dpa_memo_indicator);
+            dpa_memo_indicator &= 0x1;
+            if (dpa_memo_indicator == cpu_memo_addr->memo[block_idx]) {
+                // printf("nono..\n");
+                // printf("dpa_memo_indicator = %x, cpu_memo_addr = %x\n", dpa_memo_indicator, cpu_memo_addr->memo[block_idx]);
+                continue;
+            }
+                // printf("yes..\n");
+                // printf("dpa_memo_indicator = %x, cpu_memo_addr = %x\n", dpa_memo_indicator, cpu_memo_addr->memo[block_idx]);
+
+
+            // if we should check this block
+            cpu_memo_addr->memo[block_idx] = dpa_memo_indicator;
+
+            const uint8_t *dpa_memo_block_addr = (const uint8_t *) dpa_memo_indicator_addr;
+            uint8x16x4_t dpa_memo_block = vld1q_u8_x4(dpa_memo_block_addr);
+
+            // print_uint8x16x4(dpa_memo_block);
+
             uint64_t dpa_memo_content;
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[0], 0);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+0]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 0);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+0] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 0 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 0);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[0], 8);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+1]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 1);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+1] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 1 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 1);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[1], 0);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+2]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 0);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+2] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 2 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 0);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[1], 8);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+3]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 1);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+3] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 3 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 1);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[2], 0);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+4]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 0);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+4] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 4 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 0);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[2], 8);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+5]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 1);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+5] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 5 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 1);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[3], 0);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+6]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 0);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content);
-                cpu_memo_addr->memo[(block_idx<<3)+6] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 6 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 0);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-            dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[3], 8);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+7]) {
-                dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 1);
-                dpa_memo_content &= ~0x1ULL;
-                hostdecomp_work((uint8_t *) dpa_memo_content); cpu_memo_addr->memo[(block_idx<<3)+7] = dpa_memo_indicator;
-            }
+            // printf("--------------- thread 7 ------------------\n");
+            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 1);
+            dpa_memo_content &= ~0xFULL;
+            if (dpa_memo_content == 0) continue;
+            hostdecomp_work((uintptr_t) dpa_memo_content);
 
-
-
-
-            // for (uint32_t neon_reg_i = 0; neon_reg_i < 4; neon_reg_i++) {
-                // uint8_t dpa_memo_indicator;
-                // dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[neon_reg_i], 15);
-                // uint8x16_t diff_vec = veorq_u8(dpa_block.val[neon_reg_i], cpu_block.val[neon_reg_i]);
-                // if (vmaxvq_u8(diff_vec) != 0) {
-
-                    // uint16x8_t d_u16 = vreinterpretq_u16_u8(dpa_block.val[i]);
-                    // uint16x8_t c_u16 = vreinterpretq_u16_u8(cpu_block.val[i]);
-
-                    // if (vgetq_lane_u16(d_u16, 0) != vgetq_lane_u16(c_u16, 0)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 0);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+0U, (uint32_t)cq_idx_for_check);
-                    // }
-                    // if (vgetq_lane_u16(d_u16, 1) != vgetq_lane_u16(c_u16, 1)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 1);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+1U, (uint32_t)cq_idx_for_check);
-                    // }
-                    // if (vgetq_lane_u16(d_u16, 2) != vgetq_lane_u16(c_u16, 2)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 2);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+2U, (uint32_t)cq_idx_for_check);
-                    // }
-                    // if (vgetq_lane_u16(d_u16, 3) != vgetq_lane_u16(c_u16, 3)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 3);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+3U, (uint32_t)cq_idx_for_check);
-                    // }
-                    // if (vgetq_lane_u16(d_u16, 4) != vgetq_lane_u16(c_u16, 4)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 4);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+4U, (uint32_t)cq_idx_for_check);
-                    // }
-                    // if (vgetq_lane_u16(d_u16, 5) != vgetq_lane_u16(c_u16, 5)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 5);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+5U, (uint32_t)cq_idx_for_check);
-                    // }
-                    // if (vgetq_lane_u16(d_u16, 6) != vgetq_lane_u16(c_u16, 6)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 6);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+6U, (uint32_t)cq_idx_for_check);
-                    // }
-                    // if (vgetq_lane_u16(d_u16, 7) != vgetq_lane_u16(c_u16, 7)) {
-                        // uint16_t cq_idx_for_check = vgetq_lane_u16(d_u16, 7);
-                        // hostdecomp_decompress(ctx, (block_idx<<5)+(i<<3)+7U, (uint32_t)cq_idx_for_check);
-                    // }
-                // }
-            // }
-
-            // vst1q_u8_x4((uint8_t *) cpu_block_addr, dpa_block);
         }
 	}
 

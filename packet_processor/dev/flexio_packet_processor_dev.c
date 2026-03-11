@@ -1,4 +1,4 @@
-t/*
+/*
  * SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES.
  * Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -191,6 +191,9 @@ static void app_ctx_init(struct app_device_ctx *ctx,
 
 	/* Set context for data */
 	com_dt_ctx_init(&ctx->dt_ctx, data_from_host->sq_transf.wqd_daddr);
+
+    dpa_local_thread_memo[ctx->thread_index] = (intptr_t) ctx->rqcq_haddr_base;
+    __dpa_thread_memory_writeback();
 }
 
 #if CQE_COMP==1
@@ -222,6 +225,32 @@ static void decompress_packet(struct app_device_ctx *ctx) {
     }
 
     ctx->comp_packets_count += mini_cqe_num;
+
+    #ifdef HOSTCQ
+    __dpa_thread_window_read_inv();
+    #endif
+}
+#endif
+
+#if CQE_COMP==2
+static void decompress_packet_light(struct app_device_ctx *ctx) {
+    struct flexio_dev_cqe64 *mini_cqe_block = ctx->rq_cq_ctx.cqe;
+	uint32_t cq_idx_mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
+	struct flexio_dev_cqe64 *title_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 1U) & cq_idx_mask];
+
+    uint64_t mini_cqe = 0;
+    mini_cqe = flexio_dev_comp_cqe_get_comp_cqe(ctx->rq_cq_ctx.cqe, 0);
+
+    uint8_t current_own_bit = flexio_dev_cqe_get_owner(title_cqe);
+    current_own_bit = ((ctx->rq_cq_ctx.cq_idx + 0) & CQ_IDX_MASK) ? current_own_bit : !current_own_bit;
+        
+    memcpy(mini_cqe_block, title_cqe, 64);
+
+    mini_cqe_block->byte_cnt = (__be32) (mini_cqe >> 32) & 0xFFFFFFFF;
+    mini_cqe_block->rsvd00[3] = (__be32) (mini_cqe) & 0xFFFFFFFF;
+    mini_cqe_block->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + 0 + 1U);
+
+    mini_cqe_block->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
 
     #ifdef HOSTCQ
     __dpa_thread_window_read_inv();
@@ -346,6 +375,7 @@ static void update_data_from_host_report(struct host2dev_packet_processor_data *
 static void print_full_cqe64(struct flexio_dev_cqe64 *cqe)
 {
 	flexio_dev_print("CQE64 dump begin\n");
+	flexio_dev_print("ptr = %lx\n", (uint64_t)cqe);
 	flexio_dev_print("  rsvd00[0]=0x%08x rsvd00[1]=0x%08x rsvd00[2]=0x%08x rsvd00[3]=0x%08x rsvd00[4]=0x%08x\n",
 			 be32_to_cpu(cqe->rsvd00[0]), be32_to_cpu(cqe->rsvd00[1]),
 			 be32_to_cpu(cqe->rsvd00[2]), be32_to_cpu(cqe->rsvd00[3]),
@@ -375,6 +405,7 @@ static void print_full_cqe64(struct flexio_dev_cqe64 *cqe)
 
 #if CQE_COMP==2
 static void cqe_ptr_notification(struct app_device_ctx *ctx, flexio_uintptr_t combined_dpa_base) {
+    __dpa_thread_memory_writeback();
     uint32_t cl_base = ctx->thread_index & ~7U;
     volatile intptr_t *host_dst = (volatile intptr_t *)(uintptr_t)
         (combined_dpa_base
@@ -461,18 +492,9 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     uint64_t last_doorbelled_packet_count = ctx->packets_count;
 
 	/* Poll CQ until the package is received. */
-    (void) rand_update;
-    (void) cqe_ptr_notification;
 	while (1) {
         volatile uint8_t *current_op_own_ptr = (volatile uint8_t *) &ctx->rq_cq_ctx.cqe->op_own;
         uint8_t current_op_own = *current_op_own_ptr;
-
-        if (((ctx->thread_index & 0x7) == 0x7)) {
-            rand_update(ctx);  uint32_t rand_idx = (ctx->rand & 0x1f);
-            if ((rand_idx) == 0x0U) {
-                // cqe_ptr_notification(ctx, combined_dpa_base);
-            }
-        }
 
         #ifdef HOSTCQ
         __dpa_thread_outbox_fence(__DPA_R, __DPA_R);
@@ -486,43 +508,48 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
             continue;
         }
         #elif CQE_COMP==2
+        (void) rand_update;
+        (void) cqe_ptr_notification;
         if (((current_op_own>>2) & 0x3) == 0x3) {
+            if ((current_op_own>>4) == 0) {
+                decompress_packet_light(ctx);
+                continue;
+            }
+
+            ctx->test++;
+
+    // if (ctx->test > 1000000) {
+    // if (ctx->thread_index == 0) {
+        // flexio_dev_print("----------------------\n");
+        // for (int i = 0; i < 8; i++) {
+            // flexio_dev_print("----------------------\n");
+            // print_full_cqe64(ctx->rq_cq_ctx.cqe - 4 + i);
+        // }
+        // return;
+    // }
+    // }
+    
             if (ctx->wrote_for_host == 0) {
                 ctx->wrote_for_host = 1;
                 intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
-                /* Write to DPA-local memo — no PCIe */
+                val |= (current_op_own>>3) & 0x0E;
                 dpa_local_thread_memo[ctx->thread_index] = val;
                 ctx->indicator_for_host = !ctx->indicator_for_host;
-
-                volatile intptr_t *host_dst = (volatile intptr_t *)(uintptr_t)
-                    (combined_dpa_base
-                        + (uint64_t)ctx->thread_memo_haddr - (uint64_t)ctx->rqd_haddr_base
-                        + (uint64_t)ctx->thread_index * sizeof(intptr_t));
-                *host_dst = val;
-                // if ((ctx->thread_index & 0x7) == 0x7) cqe_ptr_notification(ctx, combined_dpa_base);
             }
-            // else {
-                // intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)!ctx->indicator_for_host);
-                // dpa_local_thread_memo[ctx->thread_index] = val;
-            // }
 
+            if (((ctx->thread_index & 0x7) == 0x0) &&
+                ctx->notified_for_host == 0) {
+                ctx->notified_for_host = 1;
+                cqe_ptr_notification(ctx, combined_dpa_base);
+            }
 
-
-            // rand_update(ctx);  uint32_t rand_idx = (ctx->rand & 0x7);
-            // if ((rand_idx) == 0x0U) {
-                // intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)!ctx->indicator_for_host);
-                // dpa_local_thread_memo[ctx->thread_index] = val;
-                // cqe_ptr_notification(ctx, combined_dpa_base);
-            // }
-
-        // if ((ctx->thread_index & 0x7) == 0x7) {
-            // rand_update(ctx);
-            // uint32_t rand_idx = (ctx->rand & 0x3f);
-            // if ((rand_idx) == 0x0U) {
-                // cqe_ptr_notification(ctx, combined_dpa_base);
-            // }
-        // }
-
+            if (ctx->notified_for_host == 1) {
+                rand_update(ctx);
+                if (!(ctx->rand & 0xFF)) {
+                    ctx->notified_for_host = 0;
+                    ctx->wrote_for_host = 0;
+                }
+            }
 
 
             __dpa_thread_window_read_inv();
@@ -531,7 +558,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         #endif
 
         if (likely(((current_op_own) & 0x1) != ctx->rq_cq_ctx.cq_hw_owner_bit)) {
-            // if (ctx->notified_for_host) cqe_ptr_notification(ctx, combined_dpa_base);
+            ctx->test = 0;
             ctx->wrote_for_host = 0;
             ctx->notified_for_host = 0;
             ctx->packets_count++;
