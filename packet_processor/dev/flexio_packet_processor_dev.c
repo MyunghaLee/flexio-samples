@@ -449,20 +449,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         }
         #elif CQE_COMP==2
         if (((current_op_own>>2) & 0x3) == 0x3) {
-            {
-            ctx->test++;
-            if (ctx->thread_index < 4) {
-                if (ctx->test > (1000000 * (ctx->thread_index + 1U))) {
-                    // flexio_dev_print("----------------------------------------\n");
-                    // flexio_dev_print("tid=%u, cqidx=%u, hw=%u, cqe=%lx\n", ctx->thread_index, ctx->rq_cq_ctx.cq_idx, ctx->rq_cq_ctx.cq_hw_owner_bit, (uint64_t)ctx->rq_cq_ctx.cqe);
-                    for(uint32_t i = 0; i < 8; i++) {
-                        // print_full_cqe64(&ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4U + i) & CQ_IDX_MASK]);
-                    }
-                    // flexio_dev_thread_reschedule();
-                    // return;
-                }
-            }
-            }
             if (ctx->wrote_for_host == 0) {
                 ctx->wrote_for_host = 1;
                 volatile intptr_t *thread_memo_dst = (volatile intptr_t *) &ctx->thread_memo->memo[ctx->thread_index];
@@ -477,7 +463,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 
         if (likely(((current_op_own) & 0x1) != ctx->rq_cq_ctx.cq_hw_owner_bit)) {
             ctx->wrote_for_host = 0;
-            ctx->test = 0;
             ctx->packets_count++;
             #ifndef RXONLY
             process_packet(ctx);
@@ -500,23 +485,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 
         break;
 	}
-    {
-    #if CQE_COMP==2
-    ctx->test++;
-    if (ctx->thread_index < 4) {
-        // flexio_dev_print("test=%u\n", ctx->test);
-        if (ctx->test > (100000 * (ctx->thread_index + 1U))) {
-            // flexio_dev_print("----------------------------------------\n");
-            // flexio_dev_print("tid=%u, cqidx=%u, hw=%u, cqe=%lx\n", ctx->thread_index, ctx->rq_cq_ctx.cq_idx, ctx->rq_cq_ctx.cq_hw_owner_bit, (uint64_t)ctx->rq_cq_ctx.cqe);
-            for(uint32_t i = 0; i < 8; i++) {
-                // print_full_cqe64(&ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 4U + i) & CQ_IDX_MASK]);
-            }
-            // flexio_dev_thread_reschedule();
-            // return;
-        }
-    }
-    #endif
-    }
 
     #ifdef HOSTCQ
     __dpa_thread_window_read_inv();

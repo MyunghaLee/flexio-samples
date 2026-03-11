@@ -1674,8 +1674,6 @@ static void *hostdecomp_poll_thread(void *arg)
             uint8_t dpa_memo_indicator;
             uint64_t dpa_memo_content;
 
-            // print_uint8x16x4(dpa_memo_block);
-
             dpa_memo_indicator = vgetq_lane_u8(dpa_memo_block.val[0], 0);
             dpa_memo_indicator &= 0x1;
             if (dpa_memo_indicator != cpu_memo_addr->memo[(block_idx<<3)+0]) {
