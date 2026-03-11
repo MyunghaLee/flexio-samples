@@ -86,17 +86,22 @@ struct app_device_ctx {
 	uint32_t window_id;          /* FlexIO window ID */
 
     uint32_t test;
-    uint8_t rsvd[14];
+    uint8_t rsvd[22];
     uint8_t wrote_for_host;
     uint8_t indicator_for_host;
     flexio_uintptr_t thread_memo_haddr;
-    struct hostdecomp_thread_memo *thread_memo;
 } __attribute__((__packed__, aligned(64)));
 
 /* Static array of per-thread contexts. Each event handler is pinned to a dedicated EU,
  * so EU i only ever accesses app_ctxs[i] — no locking required.
  */
 static struct app_device_ctx app_ctxs[APP_MAX_DPA_THREADS];
+
+/* DPA-local thread memo: threads write here (no PCIe traffic).
+ * Sized to 192 = ceil(190/8)*8 so every 8-entry group is a full 64B cache line.
+ * Only every 8th thread flushes its group's cache line to host memory.
+ */
+static intptr_t dpa_local_thread_memo[192] __attribute__((aligned(64)));
 
 FLEXIO_DEV_ALWAYS_INLINE flexio_dev_status_t flexio_dev_dbr_rq_inc_pi_value(uint32_t *rq_dbr, uint32_t value)
 {
@@ -418,13 +423,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     ctx->rq_cq_ctx.cqe = &ctx->rq_cq_ctx.cq_ring[ctx->rq_cq_ctx.cq_idx & mask];
     #endif
 
-    #if CQE_COMP==2
-    /* The shared memo is in the same global MR as the thread data (ENTITY_0 window).
-     * Compute its DPA pointer as an offset from combined_dpa_base.
-     */
-    ctx->thread_memo = (struct hostdecomp_thread_memo *)(uintptr_t)
-        (combined_dpa_base + ((uint64_t)ctx->thread_memo_haddr - ctx->rqd_haddr_base));
-    #endif
     #endif
 
     uint64_t last_packet_count = ctx->packets_count;
@@ -451,11 +449,24 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         if (((current_op_own>>2) & 0x3) == 0x3) {
             if (ctx->wrote_for_host == 0) {
                 ctx->wrote_for_host = 1;
-                volatile intptr_t *thread_memo_dst = (volatile intptr_t *) &ctx->thread_memo->memo[ctx->thread_index];
-                *thread_memo_dst = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
-                ctx->indicator_for_host = !ctx->indicator_for_host; 
+                intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
+                /* Write to DPA-local memo — no PCIe */
+                dpa_local_thread_memo[ctx->thread_index] = val;
+
+                /* Every 8th thread flushes the 64B cache line (8 entries) to host memory */
+                if ((ctx->thread_index & 7) == 7) {
+                    uint32_t cl_base = ctx->thread_index & ~7U;
+                    volatile intptr_t *host_dst = (volatile intptr_t *)(uintptr_t)
+                        (combined_dpa_base
+                         + (uint64_t)ctx->thread_memo_haddr - (uint64_t)ctx->rqd_haddr_base
+                         + (uint64_t)cl_base * sizeof(intptr_t));
+                    for (uint32_t i = 0; i < 8; i++)
+                        host_dst[i] = dpa_local_thread_memo[cl_base + i];
+                    __dpa_thread_window_writeback();
+                }
+
+                ctx->indicator_for_host = !ctx->indicator_for_host;
             }
-            __dpa_thread_window_writeback();
             __dpa_thread_window_read_inv();
             continue;
         }
