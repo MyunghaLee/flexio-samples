@@ -1435,25 +1435,7 @@ static int system_prompt(struct app_context *app_ctx)
 }
 
 #if CQE_COMP==2
-static struct host_cqe64 *hostdecomp_entry_addr(struct hostdecomp_queue_ctx *qctx,
-						  uint32_t cq_idx)
-{
-	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
 
-	return &qctx->cq_ring_addr[cq_idx & mask];
-}
-
-static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
-{
-	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
-	uint32_t i;
-
-	for (i = 0; i < cqes; i++) {
-		qctx->cq_idx++;
-		if (!(qctx->cq_idx & mask))
-			qctx->cq_hw_owner_bit = !qctx->cq_hw_owner_bit;
-	}
-}
 #define CQE_BEFORE(cqe) ( \
     ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
     (((uintptr_t)(cqe) - CQE_BSIZE) & ((uintptr_t)CQ_BSIZE - 1)) \
@@ -1464,9 +1446,22 @@ static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
     (((uintptr_t)(cqe) + CQE_BSIZE) & ((uintptr_t)CQ_BSIZE - 1)) \
 )
 
+#define CQE_BEFORE_VALUE(cqe, val) ( \
+    ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
+    (((uintptr_t)(cqe) - (CQE_BSIZE * (val))) & ((uintptr_t)CQ_BSIZE - 1)) \
+)
+
 #define CQE_AFTER_VALUE(cqe, val) ( \
     ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
     (((uintptr_t)(cqe) + (CQE_BSIZE * (val))) & ((uintptr_t)CQ_BSIZE - 1)) \
+)
+
+#define WAS_A_FLIP(cqe, val) ( \
+    CQE_BEFORE_VALUE(cqe, val) > ((uintptr_t)cqe) \
+)
+
+#define WILLBE_A_FLIP(cqe, val) ( \
+    CQE_AFTER_VALUE(cqe, val) < ((uintptr_t)cqe) \
 )
 
 static int hostdecomp_decompress(uint8_t *cqe) {
@@ -1514,90 +1509,60 @@ static int hostdecomp_work(uint8_t *cqe) {
     int scanned_cqe = 0;
 
     int ret = 0;
-    uint8_t prev_opown = 0;
     uint8_t sw_ownership = 0;
 
     goto decomp;
 
     while ((uint64_t)scanned_cqe < Q_DEPTH) {
-        scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, 1);
+        scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, 3);
         uint8_t scanning_opown = *(scanning_cqe + 63);
-        if (!((uint64_t)scanning_cqe & (CQ_BSIZE-1))) sw_ownership = !sw_ownership;
+        if (WAS_A_FLIP(scanning_cqe, 3)) sw_ownership = !sw_ownership;
 
         if ((scanning_opown & 0x0C) == 0x0C) {
+            if (!((scanning_opown >> 4) & 0x0E)) {
+                scanned_cqe += 3;
+                continue;
+            }
         decomp:
             ret = hostdecomp_decompress(scanning_cqe);
             scanned_cqe += ret;
             scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, ret - 1);
-            prev_opown = *(scanning_cqe + 63);
-            sw_ownership = prev_opown & 0x1; // maybe this can be dangerous if dpa is too fast.
+            sw_ownership = (*(scanning_cqe + 63)) & 0x1; // maybe this can be dangerous if dpa is too fast.
             continue;
         }
 
         if ((scanning_opown & 0x01) == sw_ownership) {
+            scanned_cqe += 3;
+            continue;
+        }
+
+        scanned_cqe -= 1;
+        scanning_cqe = (uint8_t *) CQE_BEFORE_VALUE(scanning_cqe, 1);
+        uint8_t scanning_opown = *(scanning_cqe + 63);
+        if (WILLBE_A_FLIP(scanning_cqe, 1)) sw_ownership = !sw_ownership;
+
+        if ((scanning_opown & 0x0C) == 0x0C) {
+            if (((scanning_opown >> 4) == 0x00)) {
+                return 0;
+            }
+            if (((scanning_opown >> 4) == 0x01)) {
+                scanned_cqe += 2;
+                scanning_cqe = (uint8_t *) CQE_AFTER_VALUE(scanning_cqe, 2);
+                uint8_t scanning_opown = *(scanning_cqe + 63);
+                if (WAS_A_FLIP(scanning_cqe, 2)) sw_ownership = !sw_ownership;
+                return 0;
+            }
+            goto decomp;
+        }
+
+        if ((scanning_opown & 0x01) == sw_ownership) {
             scanned_cqe += 1;
-            prev_opown = scanning_opown;
             continue;
         }
 
         return 0;
     }
     return 0;
-}
-/* Decompress a compressed CQE block in-place in host memory.
- * Mirrors the DPA-side decompress_if_cqe_is_compressed logic but runs on host CPU.
- * Returns 0 on success, -1 if no title CQE is available.
- */
-static int hostdecomp_decompress_current(struct hostdecomp_queue_ctx *qctx,
-					 const struct host_mini_cqe64 *compressed_cqe,
-                     struct host_cqe64 *title_cqe,
-					 uint32_t mini_cqe_num
-					 )
-{
-    uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
-
-    uint64_t mini_cqes[7] = {0};
-    for (uint32_t i = 0; i < mini_cqe_num; i++) {
-        mini_cqes[i] = compressed_cqe->mini_cqe[i];
-    }
-
-    struct host_cqe64 *current_cqe = NULL;
-    uint8_t current_own_bit = (title_cqe->op_own & 0x1);
-    { // i = 0
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
-    }
-	for (uint32_t i = 1; i < mini_cqe_num; i++) {
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx + i) & mask];
-        current_own_bit = ((qctx->cq_idx + i) & mask) ? current_own_bit : !current_own_bit;
-
-        memcpy(current_cqe, title_cqe, 64);
-
-        current_cqe->byte_cnt = (__be32) (mini_cqes[i] >> 32) & 0xFFFFFFFF;
-        current_cqe->rsvd00[3] = (__be32) (mini_cqes[i]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + i + 1U);
-        current_cqe->rsvd24[0] = (__be32) htobe32(i);
-
-        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-	}
-    { // i = 0
-        current_own_bit = (title_cqe->op_own & 0x1);
-        current_cqe = &qctx->cq_ring_addr[(qctx->cq_idx) & mask];
-        current_own_bit = ((qctx->cq_idx) & mask) ? current_own_bit : !current_own_bit;
-
-        memcpy(current_cqe, title_cqe, 63);
-
-        current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
-        current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
-        current_cqe->wqe_counter = (__be16) htobe16(be16toh(title_cqe->wqe_counter) + 1U);
-        current_cqe->rsvd24[0] = (__be32) htobe32(0xDEADBEEF);
-
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
-    }
-        title_cqe->rsvd24[0] = (__be32) htobe32(0xEEEEEEEE);
-
-	return 0;
 }
 
 void print_uint8x16x4(uint8x16x4_t d);
@@ -1621,18 +1586,6 @@ void print_uint8x16x4(uint8x16x4_t d) {
     }
 }
 
-void print_memoblock(uintptr_t d);
-void print_memoblock(uintptr_t d) {
-    uint8_t *k = (uint8_t *) d;
-    printf("-----------------------------------\n");
-    for (int i = 0; i < 8; i++) {
-        for (int j = 0; j < 8; j++) {
-            printf("%x ", *(k+8*i+j));
-        }
-        printf("\n");
-    }
-}
-
 
 /* Host observer thread: rotates across all DPA threads' host-memory CQ rings.
  * When a compressed CQE block is found it decompresses in-place so the DPA can
@@ -1641,10 +1594,6 @@ void print_memoblock(uintptr_t d) {
 static void *hostdecomp_poll_thread(void *arg)
 {
     (void) print_uint8x16x4;
-    (void) print_memoblock;
-    (void) hostdecomp_decompress_current;
-    (void) hostdecomp_advance;
-    (void) hostdecomp_entry_addr;
     (void) hostdecomp_work;
     int core_num = 15;
     cpu_set_t cpuset;
