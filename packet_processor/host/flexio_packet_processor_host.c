@@ -1531,6 +1531,7 @@ static uint16_t hostdecomp_get_vic_opown(uintptr_t cqe) {
 static int hostdecomp_work(uintptr_t cqe) {
     uintptr_t scanning_cqe = cqe;
     int scanned_cqe = 0;
+    uint8_t is_one_cqe_block_followed_by_block = 0;
 
     while ((uint64_t)scanned_cqe < Q_DEPTH) {
         uint16_t scanning_vic_opown = hostdecomp_get_vic_opown(scanning_cqe);
@@ -1550,6 +1551,8 @@ static int hostdecomp_work(uintptr_t cqe) {
         uint8_t is_prevcqe_mini_cqe_block = (prevcqe_opown & 0x0C) == 0x0C;
 
         uint8_t vic_diff = scanning_vic - prevcqe_vic;
+        uint8_t special_case1 = is_one_cqe_block_followed_by_block;
+        is_one_cqe_block_followed_by_block = 0;
 
         // assumes that mini_cqe_num 1 block is not followed by another mini cqe block.
         if (vic_diff == 1) {
@@ -1564,8 +1567,13 @@ static int hostdecomp_work(uintptr_t cqe) {
                 continue;
             }
         }
-        else if (is_scanning_mini_cqe_block && (scanning_mini_cqe_num > 1U)) {
-            if (is_prevcqe_mini_cqe_block) break;
+        else if (is_scanning_mini_cqe_block && ((scanning_mini_cqe_num > 1U) | (special_case1))) {
+            if (is_prevcqe_mini_cqe_block) {
+                is_one_cqe_block_followed_by_block = 1;
+                scanning_cqe = CQE_BEFORE(scanning_cqe);
+                scanned_cqe = 0;
+                continue;
+            }
             // printf("-------------------------------------------------------\n");
             // printf("here! ptr = %lx\n", (uint64_t)scanning_cqe);
             // for (int i = 0; i < 128; i++) {

@@ -405,7 +405,7 @@ static void print_full_cqe64(struct flexio_dev_cqe64 *cqe)
 
 #if CQE_COMP==2
 static void cqe_ptr_notification(struct app_device_ctx *ctx, flexio_uintptr_t combined_dpa_base) {
-    __dpa_thread_memory_writeback();
+    // __dpa_thread_memory_writeback();
     uint32_t cl_base = ctx->thread_index & ~7U;
     volatile intptr_t *host_dst = (volatile intptr_t *)(uintptr_t)
         (combined_dpa_base
@@ -542,15 +542,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
                 ctx->notified_for_host = 1;
                 cqe_ptr_notification(ctx, combined_dpa_base);
             }
-
-            if (ctx->notified_for_host == 1) {
-                rand_update(ctx);
-                if (!(ctx->rand & 0xFF)) {
-                    ctx->notified_for_host = 0;
-                    ctx->wrote_for_host = 0;
-                }
-            }
-
 
             __dpa_thread_window_read_inv();
             continue;
