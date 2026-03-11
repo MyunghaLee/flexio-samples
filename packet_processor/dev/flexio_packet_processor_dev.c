@@ -226,6 +226,45 @@ static void decompress_packet(struct app_device_ctx *ctx) {
 }
 #endif
 
+#if CQE_COMP==2
+static void decompress_packet_light(struct app_device_ctx *ctx, uint8_t is_two) {
+    struct flexio_dev_cqe64 *mini_cqe_block = ctx->rq_cq_ctx.cqe;
+	uint32_t cq_idx_mask = L2M(ctx->rq_cq_ctx.log_cq_depth);
+	struct flexio_dev_cqe64 *title_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx - 1U) & cq_idx_mask];
+
+    uint64_t mini_cqes[2] = {0};
+    mini_cqes[0] = flexio_dev_comp_cqe_get_comp_cqe(ctx->rq_cq_ctx.cqe, 0);
+    mini_cqes[1] = flexio_dev_comp_cqe_get_comp_cqe(ctx->rq_cq_ctx.cqe, 1);
+
+    struct flexio_dev_cqe64 *current_cqe = NULL;
+    uint8_t current_own_bit = flexio_dev_cqe_get_owner(title_cqe);
+
+    current_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx + 0) & CQ_IDX_MASK];
+    current_own_bit = ((ctx->rq_cq_ctx.cq_idx + 0) & CQ_IDX_MASK) ? current_own_bit : !current_own_bit;
+    
+    memcpy(current_cqe, title_cqe, 64);
+
+    current_cqe->byte_cnt = (__be32) (mini_cqes[0] >> 32) & 0xFFFFFFFF;
+    current_cqe->rsvd00[3] = (__be32) (mini_cqes[0]) & 0xFFFFFFFF;
+    current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + 0 + 1U);
+
+    current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+
+    if (!is_two) return;
+
+    current_cqe = &ctx->rq_cq_ctx.cq_ring[(ctx->rq_cq_ctx.cq_idx + 1) & CQ_IDX_MASK];
+    current_own_bit = ((ctx->rq_cq_ctx.cq_idx + 1) & CQ_IDX_MASK) ? current_own_bit : !current_own_bit;
+    
+    memcpy(current_cqe, title_cqe, 64);
+
+    current_cqe->byte_cnt = (__be32) (mini_cqes[1] >> 32) & 0xFFFFFFFF;
+    current_cqe->rsvd00[3] = (__be32) (mini_cqes[1]) & 0xFFFFFFFF;
+    current_cqe->wqe_counter = (__be16) cpu_to_be16(be16_to_cpu(title_cqe->wqe_counter) + 1 + 1U);
+
+    current_cqe->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
+}
+#endif
+
 /* process packet - read it, swap MAC addresses, modify it, create a send WQE and send it back.
  *  ctx - pointer to the per-thread app_device_ctx.
  */
@@ -460,6 +499,11 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         }
         #elif CQE_COMP==2
         if (((current_op_own>>2) & 0x3) == 0x3) {
+            if (!((current_op_own>>4) & 0x0E)) {
+                decompress_packet_light(ctx, ((current_op_own>>4) & 0x1));
+                continue;
+            }
+
             if (ctx->wrote_for_host == 0) {
                 ctx->wrote_for_host = 1;
                 intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
