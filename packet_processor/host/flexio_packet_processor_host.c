@@ -215,18 +215,8 @@ struct host_mini_cqe64 {
 
 /* Per-DPA-thread state for the host decompression observer. */
 struct hostdecomp_queue_ctx {
-	struct host_cqe64 *cq_ring_addr; /* pointer to the CQ ring which is on DPA mem */
-    struct hostdecomp_thread_memo *dpa_memo;
-    struct hostdecomp_cpu_memo *cpu_memo;
-	uint32_t thread_index;
-	uint32_t cq_idx;
-	uint32_t log_cq_depth;
-    uint8_t  cq_hw_owner_bit;
-    uint8_t  rsvd[3];
-	uint64_t decomp_total_ns;
-	uint64_t decomp_total_mini;
-	uint64_t decomp_last_report_mini;
-}__attribute__((__packed__, aligned(64)));
+	uintptr_t checking_cqe;
+}__attribute__((__packed__, aligned(16)));
 
 /* Single host observer that rotates across all DPA threads' CQ rings. */
 struct hostdecomp_ctx {
@@ -1384,50 +1374,8 @@ static int system_prompt(struct app_context *app_ctx)
 			if (total_pkts > 0)
 				printf("Compress percentage: %.2f%%\n",
 				       (double)total_comp / (double)total_pkts * 100.0);
-			else
+            } else
 				printf("Compress percentage: N/A (no packets received)\n");
-		} else if (cmd == 4) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 8; i++) {
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                printf("queue %d's cq_idx = %u\n", i, current_qctx->cq_idx);
-            }
-        } else if (cmd == 5) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 8; i++) {
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                printf("dpa thread %d's memo = %lu, memo_ptr = %lx\n", i, current_qctx->dpa_memo->memo[i], (uint64_t)&current_qctx->dpa_memo->memo[i]);
-            }
-        } else if (cmd == 6) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 8; i++) {
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                printf("cpu %d's memo = %u\n", i, current_qctx->cpu_memo->memo[i]);
-            }
-        } else if (cmd == 7) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 4; i++) {
-                printf("queue %d, ----------------------\n", i);
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                for (int j = 0; j < 8; j++) {
-                    struct host_cqe64 *checking_cqe = (&current_qctx->cq_ring_addr[((uint32_t)current_qctx->dpa_memo->memo[i] - 4U + (uint32_t)j) & 0x7f]);
-                    printf("%d's idx=%u, opown = %x\n", j - 4, ((uint32_t)current_qctx->dpa_memo->memo[i] - 4U + (uint32_t)j) & 0x7f, checking_cqe->op_own);
-                }
-            }
-        }
-
 		/* else: ignore unrecognized input */
 	}
 
@@ -1437,25 +1385,6 @@ static int system_prompt(struct app_context *app_ctx)
 }
 
 #if CQE_COMP==2
-static struct host_cqe64 *hostdecomp_entry_addr(struct hostdecomp_queue_ctx *qctx,
-						  uint32_t cq_idx)
-{
-	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
-
-	return &qctx->cq_ring_addr[cq_idx & mask];
-}
-
-static void hostdecomp_advance(struct hostdecomp_queue_ctx *qctx, uint32_t cqes)
-{
-	uint32_t mask = (1u << qctx->log_cq_depth) - 1u;
-	uint32_t i;
-
-	for (i = 0; i < cqes; i++) {
-		qctx->cq_idx++;
-		if (!(qctx->cq_idx & mask))
-			qctx->cq_hw_owner_bit = !qctx->cq_hw_owner_bit;
-	}
-}
 #define CQE_BEFORE(cqe) ( \
     ((uintptr_t)(cqe) & ~((uintptr_t)CQ_BSIZE - 1)) | \
     (((uintptr_t)(cqe) - CQE_BSIZE) & ((uintptr_t)CQ_BSIZE - 1)) \
@@ -1488,7 +1417,7 @@ static int hostdecomp_decompress(uintptr_t cqe) {
     int ret = 0;
     uint8x16x4_t title_cqe = vld1q_u8_x4((const uint8_t *)CQE_BEFORE(cqe));
     uint8x16x4_t compressed_cqe = vld1q_u8_x4((const uint8_t *)(cqe)); (void) compressed_cqe;
-    uint8_t compressed_opown = vgetq_lane_u8(compressed_cqe.val[3], 15); (void) compressed_opown;
+    uint8_t compressed_opown = vgetq_lane_u8(compressed_cqe.val[3], 15);
 
     uint32_t mini_cqe_num = (uint32_t)(compressed_opown>>4) + 1U;
 
@@ -1499,9 +1428,25 @@ static int hostdecomp_decompress(uintptr_t cqe) {
     uint8_t last_write_byte = dst_opown;
     title_cqe.val[3] = vsetq_lane_u8((uint8_t)0x0C, title_cqe.val[3], 15);
 
+
 back:
     ret += mini_cqe_num;
+    uint32_t i = 0;
     while (mini_cqe_num--) {
+        // 1. increment title_cqe's 61th-62th byte uint16 value (Little Endian)
+        uint16_t seq_num = vgetq_lane_u16(vreinterpretq_u16_u8(title_cqe.val[3]), 6); // 12,13 byte (61,62th)
+        seq_num = __builtin_bswap16(__builtin_bswap16(seq_num) + 1); // BE->LE 변환 후 증가(또는 바로 증가)
+        title_cqe.val[3] = vreinterpretq_u8_u16(vsetq_lane_u16(seq_num, vreinterpretq_u16_u8(title_cqe.val[3]), 6));
+
+        uint32_t comp_val_low = *((uint32_t*)((uint8_t*)&compressed_cqe + (8 * i)));
+        uint32_t comp_val_high = *((uint32_t*)((uint8_t*)&compressed_cqe + (8 * i) + 4));
+
+        // title_cqe 44-47th (val[2], lane 12-15) 수정
+        title_cqe.val[2] = vreinterpretq_u8_u32(vsetq_lane_u32(comp_val_high, vreinterpretq_u32_u8(title_cqe.val[2]), 3));
+        title_cqe.val[0] = vreinterpretq_u8_u32(vsetq_lane_u32(comp_val_low, vreinterpretq_u32_u8(title_cqe.val[0]), 3));
+        
+        i++; // 루프 인덱스 증가
+
         vst1q_u8_x4(dst, title_cqe);
         dst = (uint8_t *) CQE_AFTER(dst);
         if (!((uint64_t)dst & (CQ_BSIZE-1))) dst_opown ^= 0x1;
@@ -1528,12 +1473,14 @@ static uint16_t hostdecomp_get_vic_opown(uintptr_t cqe) {
     return *vic_opown_ptr;
 }
 
-static int hostdecomp_work(uintptr_t cqe) {
+static uintptr_t hostdecomp_work(struct hostdecomp_ctx *ctx, uintptr_t cqe) {
     uintptr_t scanning_cqe = cqe;
+    uintptr_t ret_cqe = cqe;
     int scanned_cqe = 0;
     uint8_t is_one_cqe_block_followed_by_block = 0;
 
-    while ((uint64_t)scanned_cqe < Q_DEPTH) {
+    while (!(ctx->stop) && (uint64_t)scanned_cqe < HOSTDECOMP_BURST) {
+        // printf("scanned_cqe = %d\n", scanned_cqe);
         uint16_t scanning_vic_opown = hostdecomp_get_vic_opown(scanning_cqe);
         uint8_t scanning_opown = (uint8_t) ((scanning_vic_opown & 0xFF00)>>8);
         uint8_t scanning_vic = (uint8_t) (scanning_vic_opown & 0xFF);
@@ -1554,7 +1501,6 @@ static int hostdecomp_work(uintptr_t cqe) {
         uint8_t special_case1 = is_one_cqe_block_followed_by_block;
         is_one_cqe_block_followed_by_block = 0;
 
-        // assumes that mini_cqe_num 1 block is not followed by another mini cqe block.
         if (vic_diff == 1) {
             scanning_cqe = CQE_BEFORE_VALUE(scanning_cqe, 7);
             scanned_cqe = 0;
@@ -1580,11 +1526,13 @@ static int hostdecomp_work(uintptr_t cqe) {
                 // printf("%04x\n", *(volatile uint16_t *)(CQE_AFTER_VALUE((CQE_BEFORE_VALUE(scanning_cqe, 4)), i) + 62));
             // }
             int ret = hostdecomp_decompress(scanning_cqe);
+            // printf("decomp ret = %d\n", ret);
             // printf("here! ptr = %lx\n", (uint64_t)scanning_cqe);
             // for (int i = 0; i < 128; i++) {
                 // printf("%04x\n", *(volatile uint16_t *)(CQE_AFTER_VALUE((CQE_BEFORE_VALUE(scanning_cqe, 4)), i) + 62));
             // }
             scanning_cqe = CQE_AFTER_VALUE(scanning_cqe, ret);
+            ret_cqe = scanning_cqe;
             scanned_cqe += ret;
             continue;
         }
@@ -1593,7 +1541,8 @@ static int hostdecomp_work(uintptr_t cqe) {
         scanned_cqe += 2;
         continue;
     }
-    return 0;
+    //ctx->stop = 1;
+    return ret_cqe;
 }
 /* Decompress a compressed CQE block in-place in host memory.
  * Mirrors the DPA-side decompress_if_cqe_is_compressed logic but runs on host CPU.
@@ -1638,12 +1587,119 @@ void print_memoblock(uintptr_t d) {
  * When a compressed CQE block is found it decompresses in-place so the DPA can
  * process the resulting regular CQEs on its next invocation.
  */
+// static void *hostdecomp_poll_thread_old(void *arg)
+// {
+    // (void) print_uint8x16x4;
+    // (void) print_memoblock;
+    // (void) hostdecomp_advance;
+    // (void) hostdecomp_entry_addr;
+    // (void) hostdecomp_work;
+    // int core_num = 15;
+    // cpu_set_t cpuset;
+    // CPU_ZERO(&cpuset); 
+    // CPU_SET(core_num, &cpuset);
+    // pthread_t current_thread = pthread_self();
+    // int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    // if (result != 0) {
+        // perror("pthread_setaffinity_np failed");
+    // } 
+
+	// struct hostdecomp_ctx *ctx = arg;
+
+	// if (!ctx->num_queues || !ctx->queues)
+		// return NULL;
+
+
+
+    // uint32_t dpa_memo_block_count = (uint32_t)((ctx->num_queues+7U) / 8);
+    // struct hostdecomp_thread_memo *dpa_memo_addr = ctx->queues[0].dpa_memo;
+    // struct hostdecomp_cpu_memo *cpu_memo_addr = ctx->queues[0].cpu_memo;
+
+	// while (!ctx->stop) {
+        // for (uint32_t block_idx = 0; block_idx < dpa_memo_block_count; block_idx++) {
+            // // sleep(1);
+            // // check for indicator
+            // volatile uint8_t *dpa_memo_indicator_addr = (volatile uint8_t *) &dpa_memo_addr->memo[(block_idx<<3)];
+            // uint8_t dpa_memo_indicator = *dpa_memo_indicator_addr;
+            // // printf("-----memo = %x-----\n", dpa_memo_indicator);
+            // dpa_memo_indicator &= 0x1;
+            // if (dpa_memo_indicator == cpu_memo_addr->memo[block_idx]) {
+                // // printf("nono..\n");
+                // // printf("dpa_memo_indicator = %x, cpu_memo_addr = %x\n", dpa_memo_indicator, cpu_memo_addr->memo[block_idx]);
+                // continue;
+            // }
+                // // printf("yes..\n");
+                // // printf("dpa_memo_indicator = %x, cpu_memo_addr = %x\n", dpa_memo_indicator, cpu_memo_addr->memo[block_idx]);
+
+
+            // // if we should check this block
+            // cpu_memo_addr->memo[block_idx] = dpa_memo_indicator;
+
+            // const uint8_t *dpa_memo_block_addr = (const uint8_t *) dpa_memo_indicator_addr;
+            // uint8x16x4_t dpa_memo_block = vld1q_u8_x4(dpa_memo_block_addr);
+
+            // // print_uint8x16x4(dpa_memo_block);
+
+            // uint64_t dpa_memo_content;
+
+            // // printf("--------------- thread 0 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 0);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+            // // printf("--------------- thread 1 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 1);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+            // // printf("--------------- thread 2 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 0);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+            // // printf("--------------- thread 3 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 1);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+            // // printf("--------------- thread 4 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 0);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+            // // printf("--------------- thread 5 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 1);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+            // // printf("--------------- thread 6 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 0);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+            // // printf("--------------- thread 7 ------------------\n");
+            // dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 1);
+            // dpa_memo_content &= ~0xFULL;
+            // if (dpa_memo_content == 0) continue;
+            // hostdecomp_work((uintptr_t) dpa_memo_content);
+
+        // }
+	// }
+
+	// return NULL;
+// }
+
 static void *hostdecomp_poll_thread(void *arg)
 {
     (void) print_uint8x16x4;
     (void) print_memoblock;
-    (void) hostdecomp_advance;
-    (void) hostdecomp_entry_addr;
     (void) hostdecomp_work;
     int core_num = 15;
     cpu_set_t cpuset;
@@ -1660,88 +1716,17 @@ static void *hostdecomp_poll_thread(void *arg)
 	if (!ctx->num_queues || !ctx->queues)
 		return NULL;
 
-
-
-    uint32_t dpa_memo_block_count = (uint32_t)((ctx->num_queues+7U) / 8);
-    struct hostdecomp_thread_memo *dpa_memo_addr = ctx->queues[0].dpa_memo;
-    struct hostdecomp_cpu_memo *cpu_memo_addr = ctx->queues[0].cpu_memo;
+    // uint32_t dpa_memo_block_count = (uint32_t)((ctx->num_queues+7U) / 8);
 
 	while (!ctx->stop) {
-        for (uint32_t block_idx = 0; block_idx < dpa_memo_block_count; block_idx++) {
-            // sleep(1);
-            // check for indicator
-            volatile uint8_t *dpa_memo_indicator_addr = (volatile uint8_t *) &dpa_memo_addr->memo[(block_idx<<3)];
-            uint8_t dpa_memo_indicator = *dpa_memo_indicator_addr;
-            // printf("-----memo = %x-----\n", dpa_memo_indicator);
-            dpa_memo_indicator &= 0x1;
-            if (dpa_memo_indicator == cpu_memo_addr->memo[block_idx]) {
-                // printf("nono..\n");
-                // printf("dpa_memo_indicator = %x, cpu_memo_addr = %x\n", dpa_memo_indicator, cpu_memo_addr->memo[block_idx]);
-                continue;
-            }
-                // printf("yes..\n");
-                // printf("dpa_memo_indicator = %x, cpu_memo_addr = %x\n", dpa_memo_indicator, cpu_memo_addr->memo[block_idx]);
+        struct hostdecomp_queue_ctx *qctx = &ctx->queues[ctx->next_queue_idx];
+        ctx->next_queue_idx = (ctx->next_queue_idx + 1) % ctx->num_queues;
+        // printf("next = %u\n", ctx->next_queue_idx);
 
-
-            // if we should check this block
-            cpu_memo_addr->memo[block_idx] = dpa_memo_indicator;
-
-            const uint8_t *dpa_memo_block_addr = (const uint8_t *) dpa_memo_indicator_addr;
-            uint8x16x4_t dpa_memo_block = vld1q_u8_x4(dpa_memo_block_addr);
-
-            // print_uint8x16x4(dpa_memo_block);
-
-            uint64_t dpa_memo_content;
-
-            // printf("--------------- thread 0 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 0);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-            // printf("--------------- thread 1 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[0]), 1);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-            // printf("--------------- thread 2 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 0);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-            // printf("--------------- thread 3 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[1]), 1);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-            // printf("--------------- thread 4 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 0);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-            // printf("--------------- thread 5 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[2]), 1);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-            // printf("--------------- thread 6 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 0);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-            // printf("--------------- thread 7 ------------------\n");
-            dpa_memo_content = vgetq_lane_u64(vreinterpretq_u64_u8(dpa_memo_block.val[3]), 1);
-            dpa_memo_content &= ~0xFULL;
-            if (dpa_memo_content == 0) continue;
-            hostdecomp_work((uintptr_t) dpa_memo_content);
-
-        }
+        uintptr_t ret = hostdecomp_work(ctx, qctx->checking_cqe);
+        (void) ret;
+        qctx->checking_cqe = ret;
+        // usleep(500000);
 	}
 
 	return NULL;
@@ -1775,14 +1760,14 @@ static int hostdecomp_start(struct hostdecomp_ctx *ctx, struct app_context *app_
 		struct thread_ctx *t = &app_ctx->threads[i];
 
 		/* CQ ring lives in the third region of the combined host buffer. */
-		qctx->cq_ring_addr   = (struct host_cqe64 *)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
-		qctx->thread_index   = t->thread_index;
-		qctx->cq_idx         = 0;
-		qctx->log_cq_depth   = LOG_Q_DEPTH;
-		qctx->cq_hw_owner_bit = 1;
-        /* All queues share the same memo structs at the tail of the global buffer. */
-        qctx->dpa_memo       = app_ctx->shared_dpa_memo;
-        qctx->cpu_memo       = app_ctx->shared_cpu_memo;
+		qctx->checking_cqe   = (uintptr_t)((char *)t->data_hbuf + 2 * Q_DATA_BSIZE);
+		// qctx->thread_index   = t->thread_index;
+		// qctx->cq_idx         = 0;
+		// qctx->log_cq_depth   = LOG_Q_DEPTH;
+		// qctx->cq_hw_owner_bit = 1;
+        // /* All queues share the same memo structs at the tail of the global buffer. */
+        // qctx->dpa_memo       = app_ctx->shared_dpa_memo;
+        // qctx->cpu_memo       = app_ctx->shared_cpu_memo;
 	}
 
 	if (pthread_create(&ctx->thread, NULL, hostdecomp_poll_thread, ctx)) {

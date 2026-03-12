@@ -252,9 +252,8 @@ static void decompress_packet_light(struct app_device_ctx *ctx) {
 
     mini_cqe_block->op_own = (title_cqe->op_own & (~0x01)) | (current_own_bit & 0x01);
 
-    #ifdef HOSTCQ
+    // __dpa_thread_window_writeback();
     __dpa_thread_window_read_inv();
-    #endif
 }
 #endif
 
@@ -529,19 +528,19 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     // }
     // }
     
-            if (ctx->wrote_for_host == 0) {
-                ctx->wrote_for_host = 1;
-                intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
-                val |= (current_op_own>>3) & 0x0E;
-                dpa_local_thread_memo[ctx->thread_index] = val;
-                ctx->indicator_for_host = !ctx->indicator_for_host;
-            }
+            // if (ctx->wrote_for_host == 0) {
+                // ctx->wrote_for_host = 1;
+                // intptr_t val = (uintptr_t)(((uint64_t)ctx->rq_cq_ctx.cqe - (uint64_t)combined_dpa_base + (uint64_t)ctx->rqd_haddr_base) | (uint64_t)ctx->indicator_for_host);
+                // val |= (current_op_own>>3) & 0x0E;
+                // dpa_local_thread_memo[ctx->thread_index] = val;
+                // ctx->indicator_for_host = !ctx->indicator_for_host;
+            // }
 
-            if (((ctx->thread_index & 0x7) == 0x0) &&
-                ctx->notified_for_host == 0) {
-                ctx->notified_for_host = 1;
-                cqe_ptr_notification(ctx, combined_dpa_base);
-            }
+            // if (((ctx->thread_index & 0x7) == 0x0) &&
+                // ctx->notified_for_host == 0) {
+                // ctx->notified_for_host = 1;
+                // cqe_ptr_notification(ctx, combined_dpa_base);
+            // }
 
             __dpa_thread_window_read_inv();
             continue;
