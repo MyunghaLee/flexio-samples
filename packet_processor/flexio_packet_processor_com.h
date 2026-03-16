@@ -104,7 +104,8 @@ struct host2dev_packet_processor_data {
 	uint32_t window_id;      /* FlexIO window ID for DPA→host memory access */
     uint16_t heartbeat;
 	uint8_t  not_first_run;
-    uint8_t  rsvd[45];
+    uint8_t  rsvd[37];
+    uint64_t report_reschedule_count;
 } __attribute__((__packed__, aligned(64)));
 
 #endif /* __FLEXIO_PACKET_PROCESSOR_COM_H__ */
