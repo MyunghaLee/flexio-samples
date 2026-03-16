@@ -912,6 +912,13 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
     #else
     rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_ENABLE;
     #endif
+
+    {
+        rqcq_attr.cq_period_mode = 1;
+        rqcq_attr.cq_period = 30000;
+        rqcq_attr.cq_max_count = 30000;
+    }
+
 	/* Create CQ for RQ. */
 	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
