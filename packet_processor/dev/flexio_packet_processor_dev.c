@@ -378,6 +378,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 
 	/* Validate thread index is in range. */
 	if (data_from_host->thread_index >= APP_MAX_DPA_THREADS) {
+		data_from_host->report_reschedule_count++;
 		flexio_dev_thread_reschedule();
 		return;
 	}
@@ -535,5 +536,6 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	flexio_dev_cq_arm(ctx->rq_cq_ctx.cq_idx, ctx->rq_cq_ctx.cq_number);
 
 	/* Reschedule the thread */
+	data_from_host->report_reschedule_count++;
 	flexio_dev_thread_reschedule();
 }

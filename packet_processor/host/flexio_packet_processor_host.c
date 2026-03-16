@@ -1319,7 +1319,7 @@ static int system_prompt(struct app_context *app_ctx)
 		return -1;
 	}
 
-	printf("Commands: 1=alive threads  2=Mpps  3=compress percentage%%  0=quit\n");
+	printf("Commands: 1=alive threads  2=Mpps  3=compress percentage%%  4=reschedule/thread  0=quit\n");
 
 	while (!g_quit_prompt) {
 		printf("> ");
@@ -1385,14 +1385,22 @@ static int system_prompt(struct app_context *app_ctx)
 			else
 				printf("Compress percentage: N/A (no packets received)\n");
 		} else if (cmd == 4) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 8; i++) {
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                printf("queue %d's cq_idx = %u\n", i, current_qctx->cq_idx);
-            }
+			/* Measure average reschedule count per DPA thread over 1 second.
+			 * heartbeat is incremented once per flexio_dev_thread_reschedule() call.
+			 */
+			uint64_t total_reschedules = 0;
+
+			for (i = 0; i < n; i++)
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
+			usleep(500000);
+			for (i = 0; i < n; i++) {
+				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_after[i]);
+				total_reschedules += snap_after[i].report_reschedule_count - snap_before[i].report_reschedule_count;
+			}
+			/* Multiply by 2 since we sampled over 500 ms. */
+			total_reschedules *= 2;
+			printf("Avg reschedule/thread: %.1f /sec  (total: %lu across %d threads)\n",
+			       (double)total_reschedules / n, total_reschedules, n);
         } else if (cmd == 5) {
             if (app_ctx->decomp_ctx == NULL) {
                 printf("hostdecomp not working");
