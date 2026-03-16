@@ -94,4 +94,44 @@ int destroy_matcher(struct flow_matcher *matcher);
  */
 int destroy_rule(struct flow_rule *rule);
 
+/* Shared flow steering resources — a single instance for all threads.
+ *  td              - allocated transport domain (DEVX object)
+ *  rqt             - receive-queue table containing all thread RQ numbers
+ *  tir             - indirect (RSS) TIR pointing to the rqt
+ *  rx_matcher      - single RX flow matcher (matches one SMAC)
+ *  rx_rule         - single RX flow rule routing to the RSS TIR
+ *  tx_matcher      - single TX flow matcher (DPU mode only; NULL in nic_mode)
+ *  tx_rule_table   - single TX rule forwarding to SW-steering table
+ *  tx_rule_vport   - single TX rule forwarding to vport (wire)
+ */
+struct rss_flow_resources {
+	struct mlx5dv_devx_obj *td;
+	struct mlx5dv_devx_obj *rqt;
+	struct mlx5dv_devx_obj *tir;
+	struct flow_matcher    *rx_matcher;
+	struct flow_rule       *rx_rule;
+	struct flow_matcher    *tx_matcher;
+	struct flow_rule       *tx_rule_table;
+	struct flow_rule       *tx_rule_vport;
+};
+
+/* Create shared flow steering: allocate a TD, build an RQT from rq_nums[],
+ * create an indirect Toeplitz TIR, install one RX rule matching smac, and
+ * (in DPU mode) install one TX rule forwarding packets with dmac=smac to wire.
+ *  ibv_ctx  - IBV device context
+ *  rq_nums  - array of RQ wq_num values (one per DPA thread)
+ *  num_rqs  - number of entries in rq_nums
+ *  smac     - MAC address used for both the RX SMAC match and TX DMAC match
+ *  nic_mode - if 1, skip TX rule creation
+ * Returns pointer on success, NULL on failure.
+ */
+struct rss_flow_resources *create_rss_steering(struct ibv_context *ibv_ctx,
+					       uint32_t *rq_nums, int num_rqs,
+					       uint64_t smac, int nic_mode);
+
+/* Destroy RSS flow steering resources created by create_rss_steering().
+ * Returns 0 on success, -1 if any sub-destroy failed.
+ */
+int destroy_rss_steering(struct rss_flow_resources *rss);
+
 #endif

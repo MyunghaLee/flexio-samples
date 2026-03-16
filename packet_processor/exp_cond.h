@@ -3,7 +3,7 @@
 #define HOSTDECOMP_BURST 16
 
 /* 0 - OFF, 1 - DPA_DECOMP, 2 - HOST_DECOMP */
-#define CQE_COMP 2
+#define CQE_COMP 0
 
 #define RXONLY
 // #define ZEROCOPY

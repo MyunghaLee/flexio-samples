@@ -120,18 +120,13 @@ struct thread_ctx {
 	struct flexio_rq   *flexio_rq_ptr;
 	struct flexio_mkey *rqd_mkey; // 256B
 
-	/* Flow steering (per-thread matcher + rule) */
-	struct flow_matcher *rx_matcher;
-	struct flow_rule    *rx_rule;
-	struct flow_matcher *tx_matcher;      /* NULL in nic_mode */
-	struct flow_rule    *tx_rule_table;   /* NULL in nic_mode */
-	struct flow_rule    *tx_rule_vport;   /* NULL in nic_mode */
+	/* (flow steering is now shared; see app_context.rss_steering) */
 
 	/* DPA heap address of this thread's host2dev descriptor */
 	flexio_uintptr_t app_data_daddr;
 
 	uint32_t thread_index;
-    uint8_t rsvd[12];
+    uint8_t rsvd[28];
 }  __attribute__((__packed__, aligned(64))) ;
 
 /* Application context struct holding necessary host side variables. */
@@ -159,6 +154,9 @@ struct app_context {
 	struct thread_ctx *threads;
 	/* FlexIO window for DPA→host memory access (created when --hostbuf on). */
 	struct flexio_window *window;
+
+	/* Single shared RSS flow steering (one RX rule → RSS TIR → all thread RQs). */
+	struct rss_flow_resources *rss_steering;
 
 	/* Single combined host allocation covering all threads + shared memos.
 	 * Layout: [thread0 (RQ|SQ|CQ)] ... [threadN-1 (RQ|SQ|CQ)] [dpa_memo] [cpu_memo]
@@ -337,64 +335,6 @@ static struct flexio_mkey *create_dpa_mkey(struct app_context *app_ctx, flexio_u
 // #define BASE_SMAC 0xe8ebd3a72f16ULL
 #define THREAD_SMAC(i) (BASE_SMAC + (i))
 
-/* Creates steering rules for a single thread.
- * Returns 0 on success and -1 if the allocation was failed.
- * app_ctx  - pointer to app_context structure.
- * t        - pointer to thread_ctx structure for this thread.
- * nic_mode - if set to 1, the sample runs on ConnectX part.
- */
-static int create_thread_steering_rules(struct app_context *app_ctx,
-					struct thread_ctx *t, int nic_mode)
-{
-	uint64_t smac = THREAD_SMAC(t->thread_index);
-
-	/* Create RX flow matcher. */
-	t->rx_matcher = create_matcher_rx(app_ctx->ibv_ctx);
-	if (!t->rx_matcher) {
-		printf("Failed to create RX matcher\n");
-		return -1;
-	}
-
-	/* Create RX flow rule for the specific source MAC of incoming packets. */
-	t->rx_rule = create_rule_rx_mac_match(t->rx_matcher,
-					      flexio_rq_get_tir(t->flexio_rq_ptr), smac);
-	if (!t->rx_rule) {
-		printf("Failed to create RX steering rule\n");
-		return -1;
-	}
-
-	/* If the sample runs on NIC, the outgoing rule is already configured.
-	 * If the sample runs on DPU, the outgoing rule is configured as a DROP rule,
-	 * so the sample needs to reconfigure the outgoing rule.
-	 */
-	if (!nic_mode) {
-		/* Add a rule to steer outgoing traffic to the vport for it to exit from
-		 * the DPU to the wire.
-		 */
-		/* Create TX flow matcher. */
-		t->tx_matcher = create_matcher_tx(app_ctx->ibv_ctx);
-		if (!t->tx_matcher) {
-			printf("Failed to create TX matcher\n");
-			return -1;
-		}
-
-		/* Create a TX flow rule to forward outgoing packets to SW steering table. */
-		t->tx_rule_table = create_rule_tx_fwd_to_sws_table(t->tx_matcher, smac);
-		if (!t->tx_rule_table) {
-			printf("Failed to create TX table steering rule\n");
-			return -1;
-		}
-
-		/* Create a TX flow rule to forward outgoing packets to vport (wire). */
-		t->tx_rule_vport = create_rule_tx_fwd_to_vport(t->tx_matcher, smac);
-		if (!t->tx_rule_vport) {
-			printf("Failed to create TX vport steering rule\n");
-			return -1;
-		}
-	}
-
-	return 0;
-}
 
 /* CQE size is 64B. */
 #define CQE_BSIZE 64
@@ -1092,46 +1032,6 @@ static int copy_thread_data_to_dpa(struct app_context *app_ctx, struct thread_ct
 	return ret;
 }
 
-/* Clean up previously allocated steering rules for one thread.
- * Returns 0 on success and -1 if any destroy failed.
- * t - pointer to thread_ctx for this thread.
- */
-static int clean_up_thread_rules(struct thread_ctx *t)
-{
-	int err = 0;
-
-	/* Clean up rx rule if created */
-	if (t->rx_rule && destroy_rule(t->rx_rule)) {
-		printf("Failed to destroy rx rule\n");
-		err = -1;
-	}
-
-	/* Clean up rx matcher if created */
-	if (t->rx_matcher && destroy_matcher(t->rx_matcher)) {
-		printf("Failed to destroy rx matcher\n");
-		err = -1;
-	}
-
-	/* Clean up tx rule for vport if created */
-	if (t->tx_rule_vport && destroy_rule(t->tx_rule_vport)) {
-		printf("Failed to destroy tx rule vport\n");
-		err = -1;
-	}
-
-	/* Clean up tx rule for table if created */
-	if (t->tx_rule_table && destroy_rule(t->tx_rule_table)) {
-		printf("Failed to destroy tx rule\n");
-		err = -1;
-	}
-
-	/* Clean up tx matcher if created */
-	if (t->tx_matcher && destroy_matcher(t->tx_matcher)) {
-		printf("Failed to destroy tx matcher\n");
-		err = -1;
-	}
-
-	return err;
-}
 
 /* Clean up previously allocated RQ for one thread.
  * Returns 0 on success and -1 if the destroy failed.
@@ -2133,16 +2033,36 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
-		/* Create steering rules matching SMAC = BASE_SMAC + i for this thread. */
-		if (create_thread_steering_rules(&app_ctx, t, nic_mode)) {
-			printf("Failed to create steering rules for thread %d.\n", i);
-			err = -1;
-			goto cleanup;
-		}
-
 		/* Copy queue descriptors and thread_index to DPA heap. */
 		if (copy_thread_data_to_dpa(&app_ctx, t)) {
 			printf("Failed to copy application data for thread %d.\n", i);
+			err = -1;
+			goto cleanup;
+		}
+	}
+
+	/* Create the single shared RSS RX steering rule.
+	 * Collect all RQ wq_nums, then install one rule matching BASE_SMAC that
+	 * distributes packets across all thread RQs via Toeplitz hash.
+	 */
+	{
+		uint32_t *rq_nums = calloc(app_ctx.num_threads, sizeof(uint32_t));
+
+		if (!rq_nums) {
+			printf("Failed to allocate rq_nums array\n");
+			err = -1;
+			goto cleanup;
+		}
+		for (i = 0; i < app_ctx.num_threads; i++)
+			rq_nums[i] = flexio_rq_get_wq_num(app_ctx.threads[i].flexio_rq_ptr);
+
+		app_ctx.rss_steering = create_rss_steering(app_ctx.ibv_ctx,
+							   rq_nums,
+							   app_ctx.num_threads,
+							   BASE_SMAC, nic_mode);
+		free(rq_nums);
+		if (!app_ctx.rss_steering) {
+			printf("Failed to create RSS steering\n");
 			err = -1;
 			goto cleanup;
 		}
@@ -2202,11 +2122,10 @@ cleanup:
 			}
 		}
 
-		/* Destroy steering rules (reverse order). */
-		for (i = app_ctx.num_threads - 1; i >= 0; i--) {
-			if (clean_up_thread_rules(&app_ctx.threads[i]))
-				err = -1;
-		}
+		/* Destroy shared steering (RSS RX + TX). */
+		if (app_ctx.rss_steering && destroy_rss_steering(app_ctx.rss_steering))
+			err = -1;
+		app_ctx.rss_steering = NULL;
 
 		/* Destroy RQ resources first (reverse order).
 		 * Must precede SQ cleanup so the DEVX UMEM for the host CQ ring is
