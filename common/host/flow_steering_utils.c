@@ -511,8 +511,28 @@ static struct mlx5dv_devx_obj *create_rqt(struct ibv_context *ibv_ctx,
 					   uint32_t *rq_nums, int num_rqs,
 					   uint32_t *rqtn_out)
 {
-	/* Buffer: 32-byte header + 240-byte rqtc fixed + num_rqs*4 bytes entries */
-	size_t inlen = 32 + 240 + (size_t)num_rqs * 4;
+	/* Hardware requires a power-of-two RQT size.  Use a table large enough
+	 * that each RQ appears at least RQT_MIN_SPREAD times so that the hash
+	 * distribution imbalance stays below ~1/RQT_MIN_SPREAD (≈12% for 8).
+	 * This mirrors the DPDK approach (e.g. 128-entry table for 6 queues).
+	 */
+#define RQT_MIN_SPREAD 8
+#define RQT_MAX_SIZE   2048
+
+	int target = num_rqs * RQT_MIN_SPREAD;
+
+	if (target > RQT_MAX_SIZE)
+		target = RQT_MAX_SIZE;
+	if (target < num_rqs)
+		target = num_rqs;
+
+	int rqt_size = 1;
+
+	while (rqt_size < target)
+		rqt_size <<= 1;
+
+	/* Buffer: 32-byte header + 240-byte rqtc fixed + rqt_size*4 bytes entries */
+	size_t inlen = 32 + 240 + (size_t)rqt_size * 4;
 	uint32_t *in  = calloc(1, inlen);
 	uint32_t  out[4] = {0};
 	struct mlx5dv_devx_obj *obj;
@@ -522,11 +542,11 @@ static struct mlx5dv_devx_obj *create_rqt(struct ibv_context *ibv_ctx,
 		return NULL;
 	}
 
-	in[0]  = htobe32(0x916u << 16);          /* opcode CREATE_RQT */
-	in[13] = htobe32((uint32_t)num_rqs);      /* rqt_max_size  bits[15:0] */
-	in[14] = htobe32((uint32_t)num_rqs);      /* rqt_actual_size bits[15:0] */
-	for (int i = 0; i < num_rqs; i++)
-		in[68 + i] = htobe32(rq_nums[i] & 0x00ffffffu); /* rq_num[i] bits[23:0] */
+	in[0]  = htobe32(0x916u << 16);           /* opcode CREATE_RQT */
+	in[13] = htobe32((uint32_t)rqt_size);      /* rqt_max_size  bits[15:0] */
+	in[14] = htobe32((uint32_t)rqt_size);      /* rqt_actual_size bits[15:0] */
+	for (int i = 0; i < rqt_size; i++)
+		in[68 + i] = htobe32(rq_nums[i % num_rqs] & 0x00ffffffu); /* rq_num[i] bits[23:0] */
 
 	obj = mlx5dv_devx_obj_create(ibv_ctx, in, inlen, out, sizeof(out));
 	free(in);
