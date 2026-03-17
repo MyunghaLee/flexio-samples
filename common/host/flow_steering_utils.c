@@ -516,7 +516,7 @@ static struct mlx5dv_devx_obj *create_rqt(struct ibv_context *ibv_ctx,
 	 * distribution imbalance stays below ~1/RQT_MIN_SPREAD (≈12% for 8).
 	 * This mirrors the DPDK approach (e.g. 128-entry table for 6 queues).
 	 */
-#define RQT_MIN_SPREAD 8
+#define RQT_MIN_SPREAD 32
 #define RQT_MAX_SIZE   2048
 
 	int target = num_rqs * RQT_MIN_SPREAD;

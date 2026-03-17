@@ -8,4 +8,4 @@
 #define RXONLY
 // #define ZEROCOPY
 #define HOSTBUF
-// #define HOSTCQ
+#define HOSTCQ
