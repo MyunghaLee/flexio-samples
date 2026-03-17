@@ -459,7 +459,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         volatile uint8_t *current_op_own_ptr = (volatile uint8_t *) &ctx->rq_cq_ctx.cqe->op_own;
         uint8_t current_op_own = *current_op_own_ptr;
 
-        #if defined(HOSTCQ) || defined(HOSTRQ)
+        #if defined(HOSTCQ)
         __dpa_thread_outbox_fence(__DPA_R, __DPA_R);
         #else
         __dpa_thread_memory_fence(__DPA_R, __DPA_R);

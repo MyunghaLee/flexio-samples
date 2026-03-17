@@ -61,6 +61,7 @@
 
 /* Used for clock_gettime in latency stats. */
 #include <time.h>
+#include <ctype.h>
 
 /* Used for IBV device operations. */
 #include <infiniband/mlx5dv.h>
@@ -1371,6 +1372,78 @@ static int clean_up_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 /* Set by SIGINT handler so the prompt loop exits cleanly on Ctrl-C. */
 static volatile int g_quit_prompt = 0;
 
+/* Run ngauge for ~2 seconds, parse the "Rx transport pass packets host 0" rate,
+ * and return it in pps.  Returns -1.0 on failure.
+ * Strips ANSI/CSI escape sequences from ngauge's TUI output before parsing.
+ */
+static double read_ngauge_rx_transport_pps(void)
+{
+	const char *target = "transport pass packets host 0";
+	/* ngauge requires a TTY; use script(1) to allocate a pseudo-terminal. */
+	char cmd[] = "script -q -c 'timeout 2 sudo ngauge ../all-dual-port-bf3-dpu.yml' /dev/null 2>/dev/null";
+	double result = -1.0;
+	char buf[1024];
+	FILE *fp;
+
+	fp = popen(cmd, "r");
+	if (!fp)
+		return -1.0;
+
+	while (fgets(buf, sizeof(buf), fp)) {
+		/* Strip ANSI/CSI escape sequences (ESC [ ... <letter>) in-place. */
+		char clean[1024];
+		int ci = 0;
+		unsigned char *s = (unsigned char *)buf;
+
+		while (*s && ci < (int)sizeof(clean) - 1) {
+			if (*s == 0x1b) {
+				s++;
+				if (*s == '[') {
+					s++;
+					while (*s && !isalpha(*s))
+						s++;
+					if (*s)
+						s++;
+				}
+			} else {
+				clean[ci++] = (char)*s++;
+			}
+		}
+		clean[ci] = '\0';
+
+		if (!strstr(clean, target))
+			continue;
+
+		/* Value is the first float after the closing ')' of the counter address. */
+		char *p = strrchr(clean, ')');
+
+		if (!p)
+			continue;
+		p++;
+		while (*p == ' ' || *p == '\t')
+			p++;
+
+		char *endptr;
+		double val = strtod(p, &endptr);
+
+		if (endptr == p)
+			continue;
+
+		/* Handle optional SI prefix on the unit (e.g. "Mpps", "Kpps"). */
+		while (*endptr == ' ' || *endptr == '\t')
+			endptr++;
+		if (*endptr == 'M' || *endptr == 'm')
+			val *= 1e6;
+		else if (*endptr == 'K' || *endptr == 'k')
+			val *= 1e3;
+
+		result = val; /* keep last seen value in case of multiple refreshes */
+	}
+
+	pclose(fp);
+	return result;
+}
+
 static void sigint_handler(int signum)
 {
 	(void)signum;
@@ -1449,8 +1522,12 @@ static int system_prompt(struct app_context *app_ctx)
 			}
 			printf("Alive DPA threads: %d / %d\n", alive, n);
 		} else if (cmd == 2) {
-			/* Measure aggregate packet rate over 1 second, display as Mpps. */
+			/* Measure aggregate packet rate over 0.5 s, display as Mpps.
+			 * Also query the NIC-level "Rx transport pass packets host 0"
+			 * counter via ngauge (~2 s) and print it alongside.
+			 */
 			uint64_t total_pps = 0;
+			double ngauge_pps;
 
 			for (i = 0; i < n; i++)
 				read_thread_h2d(app_ctx, &app_ctx->threads[i], &snap_before[i]);
@@ -1460,7 +1537,15 @@ static int system_prompt(struct app_context *app_ctx)
 				total_pps += snap_after[i].report_packets_count -
 					     snap_before[i].report_packets_count;
 			}
-			printf("Throughput: %.3f Mpps\n", (double)total_pps / 1e6 * 2);
+			printf("App Rx:                          %.3f Mpps\n",
+			       (double)total_pps / 1e6 * 2);
+
+			ngauge_pps = read_ngauge_rx_transport_pps();
+			if (ngauge_pps >= 0.0)
+				printf("NIC Rx transport pass host 0:    %.3f Mpps\n",
+				       ngauge_pps / 1e6);
+			else
+				printf("NIC Rx transport pass host 0:    (ngauge failed)\n");
 		} else if (cmd == 3) {
 			/* Measure comp_packets / packets over 1 second. display as percentage */
 			uint64_t total_pkts = 0, total_comp = 0;
