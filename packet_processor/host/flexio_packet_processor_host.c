@@ -107,6 +107,9 @@ struct thread_ctx {
 	 */
 	struct mlx5dv_devx_umem *rq_cq_ring_umem;
 
+	/* DEVX UMEM registration for the RQ descriptor ring in host memory (hostrq mode only). */
+	struct mlx5dv_devx_umem *rq_ring_umem;
+
 	/* Event handler */
 	struct flexio_event_handler *pp_eh;
 
@@ -530,14 +533,27 @@ static int sq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 }
 #endif
 
+/* RQ WQE byte size is 64B. */
+#define LOG_RQ_WQE_BSIZE 6
+/* RQ WQE byte size log to value. */
+#define RQ_WQE_BSIZE L2V(LOG_RQ_WQE_BSIZE)
+/* RQ ring byte size is queue depth times WQE byte size. */
+#define RQ_RING_BSIZE (Q_DEPTH * RQ_WQE_BSIZE)
+
 #ifdef HOSTBUF
 /* Per-thread region size within the global combined buffer.
- * Each thread occupies: [RQ data (Q_DATA_BSIZE) | SQ data (Q_DATA_BSIZE) | CQ ring (CQ_BSIZE, HOSTCQ)]
+ * Layout: [RQ data | SQ data | CQ ring (HOSTCQ) | RQ ring (HOSTRQ)]
  */
-#ifdef HOSTCQ
-#define PER_THREAD_HBUF_SIZE (2 * Q_DATA_BSIZE + CQ_BSIZE)
+#if defined(HOSTCQ) && defined(HOSTRQ)
+#define HOSTRQ_RING_OFFSET    (2 * Q_DATA_BSIZE + CQ_BSIZE)
+#define PER_THREAD_HBUF_SIZE  (2 * Q_DATA_BSIZE + CQ_BSIZE + RQ_RING_BSIZE)
+#elif defined(HOSTCQ)
+#define PER_THREAD_HBUF_SIZE  (2 * Q_DATA_BSIZE + CQ_BSIZE)
+#elif defined(HOSTRQ)
+#define HOSTRQ_RING_OFFSET    (2 * Q_DATA_BSIZE)
+#define PER_THREAD_HBUF_SIZE  (2 * Q_DATA_BSIZE + RQ_RING_BSIZE)
 #else
-#define PER_THREAD_HBUF_SIZE (2 * Q_DATA_BSIZE)
+#define PER_THREAD_HBUF_SIZE  (2 * Q_DATA_BSIZE)
 #endif
 
 /* Allocate the single global host buffer that covers all threads' RQ/SQ/CQ regions
@@ -709,12 +725,6 @@ static int create_thread_sq(struct app_context *app_ctx, struct thread_ctx *t)
 	return 0;
 }
 
-/* RQ WQE byte size is 64B. */
-#define LOG_RQ_WQE_BSIZE 6
-/* RQ WQE byte size log to value. */
-#define RQ_WQE_BSIZE L2V(LOG_RQ_WQE_BSIZE)
-/* RQ ring byte size is queue depth times WQE byte size. */
-#define RQ_RING_BSIZE (Q_DEPTH * RQ_WQE_BSIZE)
 #ifndef HOSTBUF
 /* Allocate DPA heap memory for SQ.
  * Returns 0 on success and -1 if the allocation fails.
@@ -731,10 +741,12 @@ static int rq_mem_alloc(struct flexio_process *process, struct app_transfer_wq *
 	if (!rq_transf->wqd_daddr)
 		return -1;
 
-	/* Allocate DPA heap memory for RQ ring. */
+	/* Allocate DPA heap memory for RQ ring (in hostrq mode the ring is in host memory). */
+#ifndef HOSTRQ
 	flexio_buf_dev_alloc(process, RQ_RING_BSIZE, &rq_transf->wq_ring_daddr);
 	if (!rq_transf->wq_ring_daddr)
 		return -1;
+#endif
 
 	/* Allocate and initialize RQ DBR memory on the DPA heap memory. */
 	flexio_copy_from_host(process, dbr, sizeof(dbr), &rq_transf->wq_dbr_daddr);
@@ -767,10 +779,12 @@ static int rq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *
 	rq_transf->wqd_daddr = (flexio_uintptr_t)(uintptr_t)t->data_hbuf;
 	rq_transf->wqd_mkey_id = t->data_mr->lkey;
 
-	/* Allocate DPA heap memory for RQ ring (descriptor ring stays on DPA). */
+#ifndef HOSTRQ
+	/* Allocate DPA heap memory for RQ ring (in hostrq mode the ring is in host memory). */
 	flexio_buf_dev_alloc(app_ctx->flexio_process, RQ_RING_BSIZE, &rq_transf->wq_ring_daddr);
 	if (!rq_transf->wq_ring_daddr)
 		return -1;
+#endif
 
 	/* Allocate and initialize RQ DBR on DPA heap. */
 	if (flexio_copy_from_host(app_ctx->flexio_process, dbr, sizeof(dbr), &rq_transf->wq_dbr_daddr)) {
@@ -789,6 +803,7 @@ static int rq_mem_alloc_hostbuf(struct app_context *app_ctx, struct thread_ctx *
  * process   - Flex IO process.
  * rq_transf - RQ transfer struct with DPA buffer addresses.
  */
+#ifndef HOSTRQ
 static int init_dpa_rq_ring(struct flexio_process *process, struct app_transfer_wq *rq_transf)
 {
 	/* RQ WQE data iterator. */
@@ -827,6 +842,51 @@ static int init_dpa_rq_ring(struct flexio_process *process, struct app_transfer_
 	free(rx_wqes);
 	return retval;
 }
+#endif /* !HOSTRQ */
+
+#if defined(HOSTBUF) && defined(HOSTRQ)
+/* Allocate RQ descriptor ring in host memory (hostrq mode).
+ * The ring resides at data_hbuf + HOSTRQ_RING_OFFSET within the combined buffer.
+ * Registers a DEVX UMEM for the ring so flexio_rq_create can use FLEXIO_MEMTYPE_HOST.
+ * Sets wq_ring_daddr to the host VA so the DPA can map it via window.
+ * Returns 0 on success, -1 on failure.
+ */
+static int rq_ring_mem_alloc_host(struct app_context *app_ctx, struct thread_ctx *t)
+{
+	void *ring_ptr = (char *)t->data_hbuf + HOSTRQ_RING_OFFSET;
+
+	memset(ring_ptr, 0, RQ_RING_BSIZE);
+
+	t->rq_ring_umem = mlx5dv_devx_umem_reg(app_ctx->ibv_ctx, ring_ptr, RQ_RING_BSIZE,
+						IBV_ACCESS_LOCAL_WRITE);
+	if (!t->rq_ring_umem) {
+		printf("Failed to register DEVX UMEM for host RQ ring.\n");
+		return -1;
+	}
+
+	/* Store host VA so DPA can translate it through the FlexIO window. */
+	t->rq_transf.wq_ring_daddr = (flexio_uintptr_t)(uintptr_t)ring_ptr;
+	return 0;
+}
+
+/* Initialize the RQ descriptor ring directly in host memory (hostrq mode).
+ * Called after rq_ring_mem_alloc_host() and after wqd_daddr/wqd_mkey_id are set.
+ */
+static int init_host_rq_ring(struct thread_ctx *t)
+{
+	struct mlx5_wqe_data_seg *dseg =
+		(struct mlx5_wqe_data_seg *)((char *)t->data_hbuf + HOSTRQ_RING_OFFSET);
+	flexio_uintptr_t wqe_data_daddr = t->rq_transf.wqd_daddr;
+	uint32_t mkey_id = t->rq_transf.wqd_mkey_id;
+	uint32_t i;
+
+	for (i = 0; i < Q_DEPTH; i++, dseg++) {
+		mlx5dv_set_data_seg(dseg, Q_DATA_ENTRY_BSIZE, mkey_id, wqe_data_daddr);
+		wqe_data_daddr += Q_DATA_ENTRY_BSIZE;
+	}
+	return 0;
+}
+#endif /* HOSTBUF && HOSTRQ */
 
 /* Initialize RQ's DBR.
  * Receive counter need to be set to number of produced WQEs.
@@ -944,8 +1004,21 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
     }
     t->rq_transf.wqd_mkey_id = flexio_mkey_get_id(t->rqd_mkey);
     #endif
+#if defined(HOSTBUF) && defined(HOSTRQ)
+	/* Allocate RQ ring in host memory and register DEVX UMEM. */
+	if (rq_ring_mem_alloc_host(app_ctx, t)) {
+		printf("Failed to alloc host memory for RQ ring.\n");
+		return -1;
+	}
+#endif
+
 	/* Initialize RQ ring. */
-	if (init_dpa_rq_ring(app_fp, &t->rq_transf)) {
+#if defined(HOSTBUF) && defined(HOSTRQ)
+	if (init_host_rq_ring(t))
+#else
+	if (init_dpa_rq_ring(app_fp, &t->rq_transf))
+#endif
+    {
 		printf("Failed to init RQ ring.\n");
 		return -1;
 	}
@@ -958,8 +1031,14 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 	rq_attr.wq_dbr_qmem.memtype = FLEXIO_MEMTYPE_DPA;
 	/* Set RQ DBR memory address. */
 	rq_attr.wq_dbr_qmem.daddr = t->rq_transf.wq_dbr_daddr;
-	/* Set RQ ring memory address. */
+	/* Set RQ ring memory: host UMEM when hostrq, else DPA heap. */
+#if defined(HOSTBUF) && defined(HOSTRQ)
+	rq_attr.wq_ring_qmem.memtype     = FLEXIO_MEMTYPE_HOST;
+	rq_attr.wq_ring_qmem.humem_offset = 0;
+	rq_attr.wq_ring_qmem.umem_id     = t->rq_ring_umem->umem_id;
+#else
 	rq_attr.wq_ring_qmem.daddr = t->rq_transf.wq_ring_daddr;
+#endif
 	/* Create the Flex IO RQ.
 	 * Second argument is NULL as RQ is created on the same GVMI as the process.
 	 */
@@ -1163,12 +1242,22 @@ static int clean_up_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
 		err = -1;
 	}
 
-	/* Clean up wq_ring_daddr for rq_transf if created */
+	/* Clean up wq_ring_daddr for rq_transf if created.
+	 * In hostrq mode wq_ring_daddr is a host VA — skip DPA free; dereg UMEM instead.
+	 */
+#if !defined(HOSTBUF) || !defined(HOSTRQ)
 	if (t->rq_transf.wq_ring_daddr &&
 	    flexio_buf_dev_free(app_ctx->flexio_process, t->rq_transf.wq_ring_daddr)) {
 		printf("Failed to free rq_transf.wq_ring_daddr\n");
 		err = -1;
 	}
+#endif
+#if defined(HOSTBUF) && defined(HOSTRQ)
+	if (t->rq_ring_umem && mlx5dv_devx_umem_dereg(t->rq_ring_umem)) {
+		printf("Failed to deregister UMEM for host RQ ring\n");
+		err = -1;
+	}
+#endif
 
     #ifndef HOSTBUF
     if (t->rq_transf.wqd_daddr &&

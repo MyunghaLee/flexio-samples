@@ -65,7 +65,8 @@ struct app_device_ctx {
 
 	uint64_t rqd_haddr_base;     /* host VA base of RQ data buffer */
 	uint64_t sqd_haddr_base;     /* host VA base of SQ data buffer */
-	uint64_t rqcq_haddr_base;        /* host VA of RQ CQ ring (hostcq mode) */
+	uint64_t rqcq_haddr_base;    /* host VA of RQ CQ ring (hostcq mode) */
+	uint64_t rq_ring_haddr_base; /* host VA of RQ descriptor ring (hostrq mode) */
 
 	/* Per-invocation DPA window pointers (set at start of each handler call) */
 	flexio_uintptr_t rqd_dpa_base;
@@ -145,6 +146,13 @@ static void app_ctx_init(struct app_device_ctx *ctx,
     ctx->rqcq_haddr_base = data_from_host->rq_cq_transf.cq_ring_daddr;
     #endif
 
+    #ifdef HOSTRQ
+	/* When hostrq is on, the RQ descriptor ring is in host memory.
+	 * Save the host VA; rq_ring pointer is updated per-invocation via window.
+	 */
+    ctx->rq_ring_haddr_base = data_from_host->rq_transf.wq_ring_daddr;
+    #endif
+
     ctx->wrote_for_host = 0;
     ctx->indicator_for_host = 1;
     ctx->thread_memo_haddr = data_from_host->thread_memo;
@@ -163,10 +171,16 @@ static void app_ctx_init(struct app_device_ctx *ctx,
             #endif
 			data_from_host->rq_cq_transf.cq_dbr_daddr);
 
-	/* Set context for RQ */
+	/* Set context for RQ.
+	 * When hostrq: pass 0 for wq_ring_daddr — updated per-invocation via window.
+	 */
 	com_rq_ctx_init(&ctx->rq_ctx,
 			data_from_host->rq_transf.wq_num,
+            #ifdef HOSTRQ
+			0,
+            #else
 			data_from_host->rq_transf.wq_ring_daddr,
+            #endif
 			data_from_host->rq_transf.wq_dbr_daddr);
 
 	/* Set context for SQ */
@@ -419,6 +433,14 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
     ctx->rq_cq_ctx.cqe = &ctx->rq_cq_ctx.cq_ring[ctx->rq_cq_ctx.cq_idx & mask];
     #endif
 
+    #ifdef HOSTRQ
+    /* When hostrq is on, the RQ descriptor ring lives in host memory.
+     * Window state resets each invocation, so recompute the DPA window pointer.
+     */
+    ctx->rq_ctx.rq_ring = (struct flexio_dev_wqe_rcv_data_seg *)(uintptr_t)
+        (combined_dpa_base + (ctx->rq_ring_haddr_base - ctx->rqd_haddr_base));
+    #endif
+
     #if CQE_COMP==2
     /* The shared memo is in the same global MR as the thread data (ENTITY_0 window).
      * Compute its DPA pointer as an offset from combined_dpa_base.
@@ -437,7 +459,7 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
         volatile uint8_t *current_op_own_ptr = (volatile uint8_t *) &ctx->rq_cq_ctx.cqe->op_own;
         uint8_t current_op_own = *current_op_own_ptr;
 
-        #ifdef HOSTCQ
+        #if defined(HOSTCQ) || defined(HOSTRQ)
         __dpa_thread_outbox_fence(__DPA_R, __DPA_R);
         #else
         __dpa_thread_memory_fence(__DPA_R, __DPA_R);
