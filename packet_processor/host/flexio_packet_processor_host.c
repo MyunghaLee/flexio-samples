@@ -972,6 +972,13 @@ static int create_thread_rq(struct app_context *app_ctx, struct thread_ctx *t)
     #else
     rqcq_attr.cqe_comp_type = FLEXIO_CQE_COMP_ENABLE;
     #endif
+
+    #ifdef CQ_MODERATION
+    rqcq_attr.cq_period_mode = CQ_PERIOD_MODE;
+    rqcq_attr.cq_period = CQ_PERIOD;
+    rqcq_attr.cq_max_count = CQ_MAX_COUNT;
+    #endif
+
 	/* Create CQ for RQ. */
 	if (flexio_cq_create(app_fp, NULL, &rqcq_attr, &t->flexio_rq_cq_ptr)) {
 		printf("Failed to create Flex IO CQ\n");
@@ -1408,7 +1415,7 @@ static int system_prompt(struct app_context *app_ctx)
 		return -1;
 	}
 
-	printf("Commands: 1=alive threads  2=Mpps  3=compress percentage%%  4=reschedule/thread  0=quit\n");
+	printf("Commands: 1=alive threads  2=Mpps  3=compress percentage%%  4=reschedule/thread  5=CQ moderation  0=quit\n");
 
 	while (!g_quit_prompt) {
 		printf("> ");
@@ -1491,34 +1498,38 @@ static int system_prompt(struct app_context *app_ctx)
 			printf("Avg reschedule/thread: %.1f /sec  (total: %lu across %d threads)\n",
 			       (double)total_reschedules / n, total_reschedules, n);
         } else if (cmd == 5) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 8; i++) {
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                printf("dpa thread %d's memo = %lu, memo_ptr = %lx\n", i, current_qctx->dpa_memo->memo[i], (uint64_t)&current_qctx->dpa_memo->memo[i]);
-            }
-        } else if (cmd == 6) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 8; i++) {
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                printf("cpu %d's memo = %u\n", i, current_qctx->cpu_memo->memo[i]);
-            }
-        } else if (cmd == 7) {
-            if (app_ctx->decomp_ctx == NULL) {
-                printf("hostdecomp not working");
-                continue;
-            }
-            for (i = 0; i < 4; i++) {
-                printf("queue %d, ----------------------\n", i);
-                struct hostdecomp_queue_ctx *current_qctx =  &app_ctx->decomp_ctx->queues[i];
-                for (int j = 0; j < 8; j++) {
-                    struct host_cqe64 *checking_cqe = (&current_qctx->cq_ring_addr[((uint32_t)current_qctx->dpa_memo->memo[i] - 4U + (uint32_t)j) & 0x7f]);
-                    printf("%d's idx=%u, opown = %x\n", j - 4, ((uint32_t)current_qctx->dpa_memo->memo[i] - 4U + (uint32_t)j) & 0x7f, checking_cqe->op_own);
+            /* Set CQ moderation on all RQ CQs, then query and print the result. */
+            unsigned int max_count, period, mode;
+
+            printf("mode period max_count: ");
+            fflush(stdout);
+            if (scanf("%u %u %u", &mode, &period, &max_count) != 3) {
+                printf("Invalid input. Expected: mode period max_count\n");
+                /* Consume leftover input. */
+                if (!fgets(line, sizeof(line), stdin)) { /* ignore */ }
+            } else {
+                /* Consume the newline left by scanf. */
+                if (!fgets(line, sizeof(line), stdin)) { /* ignore */ }
+
+                for (i = 0; i < n; i++) {
+                    if (flexio_cq_modify_moderation(app_ctx->threads[i].flexio_rq_cq_ptr,
+                                                    (uint16_t)max_count,
+                                                    (uint16_t)period,
+                                                    (uint16_t)mode))
+                        printf("Thread %d: flexio_cq_modify_moderation failed\n", i);
+                }
+
+                usleep(500000);
+
+                for (i = 0; i < 1; i++) {
+                    uint16_t q_max_count, q_period, q_mode;
+
+                    if (flexio_cq_query_moderation(app_ctx->threads[i].flexio_rq_cq_ptr,
+                                                   &q_max_count, &q_period, &q_mode))
+                        printf("Thread %d: flexio_cq_query_moderation failed\n", i);
+                    else
+                        printf("Thread %2d: mode=%u  period=%u  max_count=%u\n",
+                               i, q_mode, q_period, q_max_count);
                 }
             }
         }
