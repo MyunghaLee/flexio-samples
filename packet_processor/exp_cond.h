@@ -6,11 +6,11 @@
 #define CQ_MAX_COUNT 0
 
 /* 0 - OFF, 1 - DPA_DECOMP, 2 - HOST_DECOMP */
-#define CQE_COMP 0
+#define CQE_COMP 1
 
 #define RXONLY
 // #define ZEROCOPY
 #define HOSTBUF
-// #define HOSTCQ
-#define HOSTRQ
+#define HOSTCQ
+// #define HOSTRQ
 // #define CQ_MODERATION
