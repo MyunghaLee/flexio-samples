@@ -1,6 +1,5 @@
 #define DOORBELL_BURST 12
 #define LOG_QUEUE_SIZE 7
-#define HOSTDECOMP_BURST 16
 
 #define CQ_PERIOD_MODE 0
 #define CQ_PERIOD 0
